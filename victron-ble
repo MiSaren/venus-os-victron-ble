@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""victron-ble: configure dbus-victron-ble and show what it receives.
+
+  victron-ble                     status: devices heard, keys, published services
+  victron-ble scan [SECONDS]      listen for Victron devices directly (needs root)
+  victron-ble key MAC KEY         set the instant readout key of a device
+  victron-ble name MAC NAME       name shown in the GUI and on VRM
+  victron-ble forget MAC          remove the key; the device is no longer published
+
+The key: VictronConnect > the device > settings (gear) > menu > Product info >
+Instant readout via Bluetooth: Enable, then "Show" next to the encryption data.
+"""
+
+import argparse
+import json
+import os
+import select
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(1, os.path.join(HERE, "ext", "velib_python"))
+sys.path.insert(1, HERE)
+
+from victronble import aes, hci, products, records  # noqa: E402
+from victronble import settings as st  # noqa: E402
+
+STATUS_FILE = "/run/dbus-victron-ble/status.json"
+
+STATE_TEXT = {
+    0: "off",
+    2: "fault",
+    3: "bulk",
+    4: "absorption",
+    5: "float",
+    6: "storage",
+    7: "equalize",
+    9: "inverting",
+    11: "power supply",
+    245: "starting up",
+    246: "repeated absorption",
+    247: "recondition",
+    248: "battery safe",
+    252: "external control",
+}
+
+
+def die(msg):
+    sys.stderr.write("victron-ble: %s\n" % msg)
+    sys.exit(1)
+
+
+def connect_settings():
+    import dbus
+
+    try:
+        bus = dbus.SessionBus() if st.bus_type() == dbus.bus.BUS_SESSION else dbus.SystemBus()
+        return st.Settings(bus)
+    except dbus.exceptions.DBusException as e:
+        die("cannot connect to D-Bus: %s" % e)
+
+
+def mac_arg(text):
+    mac = st.normalize_mac(text)
+    if mac is None:
+        die("'%s' is not a Bluetooth address (AA:BB:CC:DD:EE:FF)" % text)
+    return mac
+
+
+def fmt(value, spec, unit=""):
+    return "--" if value is None else (spec % value) + unit
+
+
+def summary(entry):
+    v = entry.get("values") or {}
+    rt = entry.get("record_type")
+    if rt == records.BATTERY_MONITOR:
+        parts = [
+            fmt(v.get("/Dc/0/Voltage"), "%.2f", " V"),
+            fmt(v.get("/Dc/0/Current"), "%.2f", " A"),
+            fmt(v.get("/Soc"), "%.1f", " %"),
+        ]
+        if v.get("/Dc/1/Voltage") is not None:
+            parts.append("starter " + fmt(v.get("/Dc/1/Voltage"), "%.2f", " V"))
+        if v.get("/Dc/0/Temperature") is not None:
+            parts.append(fmt(v.get("/Dc/0/Temperature"), "%.1f", " C"))
+    elif rt == records.SOLAR_CHARGER:
+        parts = [
+            fmt(v.get("/Yield/Power"), "%d", " W"),
+            fmt(v.get("/Dc/0/Voltage"), "%.2f", " V"),
+            fmt(v.get("/Dc/0/Current"), "%.1f", " A"),
+            "today " + fmt(v.get("/History/Daily/0/Yield"), "%.2f", " kWh"),
+            STATE_TEXT.get(v.get("/State"), "state %s" % v.get("/State")),
+        ]
+    elif rt == records.AC_CHARGER:
+        parts = [
+            fmt(v.get("/Dc/0/Voltage"), "%.2f", " V"),
+            fmt(v.get("/Dc/0/Current"), "%.1f", " A"),
+            STATE_TEXT.get(v.get("/State"), "state %s" % v.get("/State")),
+        ]
+    else:
+        parts = []
+    return ", ".join(parts)
+
+
+def cmd_status(args):
+    try:
+        with open(args.status_file) as f:
+            status = json.load(f)
+    except FileNotFoundError:
+        die(
+            "no status (%s): is dbus-victron-ble running? 'svstat /service/dbus-victron-ble'"
+            % args.status_file
+        )
+    age = time.time() - os.stat(args.status_file).st_mtime
+    print(
+        "dbus-victron-ble %s, up %d s, Bluetooth: %s, advertisements: %d (Victron %d)%s"
+        % (
+            status.get("version"),
+            status.get("uptime", 0),
+            ", ".join(status.get("controllers") or []) or "none",
+            status.get("advertisements", 0),
+            status.get("victron_advertisements", 0),
+            "" if age < 30 else "  [status is %d s old: not running?]" % age,
+        )
+    )
+    devices = status.get("devices") or []
+    if not devices:
+        print("\nNo Victron devices heard yet. Is 'Instant readout via Bluetooth' enabled in VictronConnect?")
+        return
+    print(
+        "\n%-17s  %-34s %-16s %5s %6s  %-3s  %s"
+        % ("ADDRESS", "PRODUCT", "TYPE", "RSSI", "HEARD", "KEY", "STATE")
+    )
+    for d in devices:
+        heard = "-" if d.get("seen_ago") is None else "%ds" % d["seen_ago"]
+        print(
+            "%-17s  %-34s %-16s %5s %6s  %-3s  %s"
+            % (
+                d["mac"],
+                (d.get("product") or "")[:34],
+                (d.get("type") or "")[:16],
+                "" if d.get("rssi") is None else d["rssi"],
+                heard,
+                "yes" if d.get("key") else "no",
+                d.get("state"),
+            )
+        )
+        if d.get("service"):
+            name = (' "%s"' % d["name"]) if d.get("name") else ""
+            print("%19s%s (instance %s)%s: %s" % ("-> ", d["service"], d.get("instance"), name, summary(d)))
+
+
+def cmd_scan(args):
+    controllers = hci.list_controllers()
+    if not controllers:
+        die("no Bluetooth controller")
+    fds = []
+    for dev_id in controllers:
+        try:
+            fds.append(hci.open_raw_socket(dev_id))
+        except OSError as e:
+            die("hci%d: %s (run as root)" % (dev_id, e))
+    seen = {}
+    total = 0
+    end = time.monotonic() + args.seconds
+    print("Listening %d s for Victron devices (dbus-ble-sensors keeps the radio scanning)..." % args.seconds)
+    while time.monotonic() < end:
+        ready, _, _ = select.select(fds, [], [], max(0.0, end - time.monotonic()))
+        for fd in ready:
+            while True:
+                try:
+                    pkt = os.read(fd, 1024)
+                except BlockingIOError:
+                    break
+                except OSError as e:
+                    die("reading from Bluetooth failed: %s" % e)
+                for address, rssi, adv in hci.parse_event(pkt):
+                    total += 1
+                    data = hci.manufacturer_data(adv, 0x02E1)
+                    if not data or len(data) < 4 or data[0] != 0x10:
+                        continue
+                    entry = seen.setdefault(address, {"count": 0, "record_type": None})
+                    entry.update(product_id=data[2] | (data[3] << 8), rssi=rssi)
+                    entry["count"] += 1
+                    rec = records.parse_manufacturer_data(data)
+                    if rec is not None:
+                        entry["record_type"] = rec[1]  # instant readout data present
+    for fd in fds:
+        os.close(fd)
+    print("%d advertisements, %d Victron device(s)\n" % (total, len(seen)))
+    if not seen:
+        print("No Victron device heard: in range? 'Instant readout via Bluetooth' enabled in VictronConnect?")
+        return
+    print("%-17s  %-34s %-16s %5s %6s  %s" % ("ADDRESS", "PRODUCT", "TYPE", "RSSI", "COUNT", "SUPPORTED"))
+    for address, e in sorted(seen.items()):
+        if e["record_type"] is None:
+            kind, supported = "-", "instant readout off"
+        else:
+            decoder = records.DECODERS.get(e["record_type"])
+            kind, supported = records.record_type_name(e["record_type"]), "yes" if decoder else "no"
+        print(
+            "%-17s  %-34s %-16s %5d %6d  %s"
+            % (address, products.name(e["product_id"])[:34], kind[:16], e["rssi"], e["count"], supported)
+        )
+    if any(e["record_type"] is None for e in seen.values()):
+        print("\n'instant readout off': in VictronConnect, Product info > Instant readout via Bluetooth.")
+
+
+def store(mac, name, value):
+    import dbus
+
+    try:
+        connect_settings().set_device_setting(mac, name, value)
+    except (dbus.exceptions.DBusException, RuntimeError) as e:
+        die("cannot store the setting (is localsettings running?): %s" % e)
+
+
+def cmd_key(args):
+    mac = mac_arg(args.mac)
+    key = aes.parse_key(args.key)
+    if key is None:
+        die("the key must be 32 hexadecimal digits")
+    store(mac, "Key", key.hex())
+    print("%s: key stored (key check byte %02x); dbus-victron-ble picks it up within seconds" % (mac, key[0]))
+
+
+def cmd_name(args):
+    mac = mac_arg(args.mac)
+    store(mac, "CustomName", args.name)
+    print('%s: name set to "%s"' % (mac, args.name))
+
+
+def cmd_forget(args):
+    mac = mac_arg(args.mac)
+    store(mac, "Key", "")
+    print("%s: key removed, the device is no longer published" % mac)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="victron-ble",
+        description=__doc__.split("\n\n")[0],
+        epilog=__doc__.split("\n\n", 2)[-1],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--status-file", default=STATUS_FILE, help=argparse.SUPPRESS)
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("status", help="show devices and published services")
+    p = sub.add_parser("scan", help="listen for Victron devices directly")
+    p.add_argument("seconds", nargs="?", type=int, default=20)
+    p = sub.add_parser("key", help="set the instant readout key of a device")
+    p.add_argument("mac")
+    p.add_argument("key")
+    p = sub.add_parser("name", help="set the name shown in the GUI and on VRM")
+    p.add_argument("mac")
+    p.add_argument("name")
+    p = sub.add_parser("forget", help="remove the key of a device")
+    p.add_argument("mac")
+    args = parser.parse_args()
+    {"scan": cmd_scan, "key": cmd_key, "name": cmd_name, "forget": cmd_forget}.get(args.cmd, cmd_status)(args)
+
+
+if __name__ == "__main__":
+    main()
