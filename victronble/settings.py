@@ -48,8 +48,8 @@ def device_id(mac):
     return DEVICE_PREFIX + mac.replace(":", "").lower()
 
 
-def device_path(mac, name):
-    return "/Settings/Devices/%s/%s" % (device_id(mac), name)
+def device_path(mac, name, group_suffix=""):
+    return "/Settings/Devices/%s%s/%s" % (device_id(mac), group_suffix, name)
 
 
 def unwrap(value):
@@ -134,10 +134,11 @@ class Settings:
         if self.set(path, value) != 0:
             raise RuntimeError("SetValue %s rejected" % path)
 
-    def device_instance(self, mac, role, default=DEFAULT_INSTANCE):
+    def device_instance(self, mac, role, default=DEFAULT_INSTANCE, group_suffix=""):
         """VRM device instance via ClassAndVrmInstance; localsettings hands out
-        a free instance when the default one is taken."""
-        path = device_path(mac, "ClassAndVrmInstance")
+        a free instance when the default one is taken. A second service of the
+        same device (the DC source of a charger) uses its own settings group."""
+        path = device_path(mac, "ClassAndVrmInstance", group_suffix)
         value = self.add(path, "%s:%d" % (role, default))
         cls, _, instance = str(value).partition(":")
         if cls != role:

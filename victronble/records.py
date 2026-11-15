@@ -300,6 +300,37 @@ class AcCharger(Decoder):
 
 DECODERS = dict((d.record_type, d) for d in (BatteryMonitor(), SolarCharger(), AcCharger()))
 
+# Optional second service for an AC charger: a DC source of the type "AC
+# charger" (VE_REG_BMV_MONITOR_MODE -2, as a SmartShunt in DC energy meter mode
+# would publish it). gui-v2 shows such a source with its power on the overview
+# page; a com.victronenergy.charger service only gets the "Inverter / Charger"
+# widget, which shows the system state.
+MONITOR_MODE_AC_CHARGER = -2
+DCSOURCE_PATHS = {
+    "/Dc/0/Voltage": "%.2fV",
+    "/Dc/0/Current": "%.1fA",
+    "/Dc/0/Power": "%.0fW",
+    "/Dc/0/Temperature": "%.0fC",
+}
+
+
+def charger_dc_totals(values):
+    """An AC charger's decoded values -> DC source values: output 1 voltage,
+    total current and power of all outputs. No energy counter on purpose."""
+    power = current = None
+    for n in range(len(AcCharger.OUTPUTS)):
+        voltage, amps = values.get("/Dc/%d/Voltage" % n), values.get("/Dc/%d/Current" % n)
+        if voltage is None or amps is None:
+            continue
+        power = (power or 0.0) + voltage * amps
+        current = (current or 0.0) + amps
+    return {
+        "/Dc/0/Voltage": values.get("/Dc/0/Voltage"),
+        "/Dc/0/Current": None if current is None else round(current, 1),
+        "/Dc/0/Power": None if power is None else round(power, 1),
+        "/Dc/0/Temperature": values.get("/Dc/0/Temperature"),
+    }
+
 
 def parse_manufacturer_data(data):
     """Split Victron manufacturer data (after the 0x02E1 company id).

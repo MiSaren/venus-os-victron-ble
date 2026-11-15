@@ -6,6 +6,8 @@
   victron-ble key MAC KEY         set the instant readout key of a device
   victron-ble name MAC NAME       name shown in the GUI and on VRM
   victron-ble forget MAC          remove the key; the device is no longer published
+  victron-ble dcsource MAC on|off AC charger: also publish it as a DC source, so
+                                  that the gui-v2 overview shows it with its power
 
 The key: VictronConnect > the device > settings (gear) > menu > Product info >
 Instant readout via Bluetooth: Enable, then "Show" next to the encryption data.
@@ -149,6 +151,13 @@ def cmd_status(args):
         if d.get("service"):
             name = (' "%s"' % d["name"]) if d.get("name") else ""
             print("%19s%s (instance %s)%s: %s" % ("-> ", d["service"], d.get("instance"), name, summary(d)))
+        if d.get("mirror"):
+            print(
+                "%19s%s (instance %s), DC source of type AC charger"
+                % ("+ ", d["mirror"], d.get("mirror_instance"))
+            )
+        elif d.get("dcsource") and d.get("record_type") not in (None, records.AC_CHARGER):
+            print("%19sDcSource is set, but only AC chargers are published as a DC source" % "")
 
 
 def cmd_scan(args):
@@ -231,6 +240,16 @@ def cmd_name(args):
     print('%s: name set to "%s"' % (mac, args.name))
 
 
+def cmd_dcsource(args):
+    mac = mac_arg(args.mac)
+    store(mac, "DcSource", 1 if args.state == "on" else 0)
+    if args.state == "on":
+        print("%s: also published as a DC source (AC charger) for the gui-v2 overview." % mac)
+        print("Note: VRM then lists the charger twice, as charger and as DC meter.")
+    else:
+        print("%s: no longer published as a DC source" % mac)
+
+
 def cmd_forget(args):
     mac = mac_arg(args.mac)
     store(mac, "Key", "")
@@ -257,8 +276,18 @@ def main():
     p.add_argument("name")
     p = sub.add_parser("forget", help="remove the key of a device")
     p.add_argument("mac")
+    p = sub.add_parser("dcsource", help="AC charger: also publish it as a DC source (gui-v2 overview)")
+    p.add_argument("mac")
+    p.add_argument("state", choices=["on", "off"])
     args = parser.parse_args()
-    {"scan": cmd_scan, "key": cmd_key, "name": cmd_name, "forget": cmd_forget}.get(args.cmd, cmd_status)(args)
+    commands = {
+        "scan": cmd_scan,
+        "key": cmd_key,
+        "name": cmd_name,
+        "forget": cmd_forget,
+        "dcsource": cmd_dcsource,
+    }
+    commands.get(args.cmd, cmd_status)(args)
 
 
 if __name__ == "__main__":

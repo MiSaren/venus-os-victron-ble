@@ -130,6 +130,35 @@ Derived values:
 - `/Mgmt/InsecureConnection` = 1, so that systemcalc does not use the voltage
   for shared voltage sense.
 
+**DC source for an AC charger (optional).** gui-v2 shows a
+`com.victronenergy.charger` service only in its *Inverter / Charger* widget,
+whose text is the system state (*Off* without an inverter/charger). DC sources
+appear on the overview with their power instead; a `dcsource` with
+`/Settings/MonitorMode` = -2 gets the *AC charger* box. With `DcSource` = 1 in
+a charger's settings, the charger is therefore also published as
+`com.victronenergy.dcsource.victron_<mac>`. It shows output 1 voltage, total
+current, total power and temperature. The charger service stays, because only
+it enters systemcalc's DC loads calculation. systemcalc does not count DC
+sources there, so nothing is counted twice. The DC source has no
+`/History/EnergyOut`, which vrmlogger would add to the alternator/DC source
+energy. The cost is a second entry in the VRM device list. The DC source has its own VRM
+instance from the settings group `victron_<mac>_dcsource` and lives and dies
+with the charger service. The approach follows ChargerMeter (mebitek), which
+mirrors a wired IP22 in the same way; no code was taken from it.
+
+gui-v2 (v1.3) has a catch with DC sources that appear while it runs. It
+fetches a new service's items with one `GetItems` call and creates them in
+alphabetical order (veutil keeps them in a `QMap`). It treats a service as a
+device as soon as it has a device instance and a name. A DC meter model then
+reads `/Settings/MonitorMode` once, and that item is created after
+`/DeviceInstance`, `/CustomName` and `/ProductName`. The source therefore
+becomes a *Generic source* for good, with 0 A, because the widget's own
+filter later sees the real type. The DC source service therefore starts without
+`/ProductName` and `/CustomName`. It publishes them about 10 seconds later,
+when gui-v2 has all items and `/Settings/MonitorMode` decides the type. The
+device instance is valid from the start, so dbus-monitor based services
+(systemcalc, vrmlogger) see a normal service.
+
 **`/Yield/User`.** VRM computes solar energy from increases of the total yield
 (vrmlogger's kWh deltas). It ignores a counter at zero and flags counters that
 go backwards, so the synthetic counter starts invalid, only grows, and is kept
@@ -147,6 +176,7 @@ most every 10 minutes and at shutdown. After a crash the counter can lose up to
   localsettings moves a new device to the next free instance.
 - Only devices with a valid key are published; others are listed in the status
   (at most 100, forgotten after an hour without advertisements).
+- `DcSource` (0/1): also publish an AC charger as a DC source (see above).
 - If `com.victronenergy.ble` lists the device as enabled
   (`/Devices/victron_<mac>/Enabled` = 1), `dbus-ble-sensors` publishes it itself
   and this service steps aside.
@@ -165,8 +195,8 @@ most every 10 minutes and at shutdown. After a crash the counter can lose up to
 - Wrong key (key check byte mismatch): the service is removed and a warning is
   logged every 10 minutes. A new key takes effect immediately.
 - Settings are read at start (retried until localsettings is up), on every
-  `PropertiesChanged` of a `Key` or `CustomName` setting (within 0.5 s), and
-  every 60 seconds.
+  `PropertiesChanged` of a `Key`, `CustomName` or `DcSource` setting (within
+  0.5 s), and every 60 seconds.
 - A record type change (a SmartShunt switched to DC energy meter mode, for
   example) replaces the service.
 

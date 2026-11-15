@@ -110,6 +110,7 @@ def main():
     )
     parser.add_argument("--replay", metavar="FILE", help="feed advertisements from FILE (testing)")
     parser.add_argument("--replay-loop", action="store_true", help="repeat the replay file forever")
+    parser.add_argument("--dcsource-name-delay", type=float, default=10, help=argparse.SUPPRESS)  # tests
     parser.add_argument("--no-hci", action="store_true", help="do not listen to Bluetooth")
     parser.add_argument("-d", "--debug", action="store_true")
     parser.add_argument("-V", "--version", action="version", version=VERSION)
@@ -123,7 +124,13 @@ def main():
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = connect_bus()
 
-    manager = Manager(bus, timeout=args.timeout, state_file=args.state_file, status_file=args.status_file)
+    manager = Manager(
+        bus,
+        timeout=args.timeout,
+        state_file=args.state_file,
+        status_file=args.status_file,
+        mirror_name_delay=args.dcsource_name_delay,
+    )
 
     def load_config():
         if not manager.reload_config():
@@ -150,7 +157,7 @@ def main():
     def on_setting_changed(changes, path=None):
         if not path or not path.startswith("/Settings/Devices/" + st.DEVICE_PREFIX):
             return
-        if path.rsplit("/", 1)[-1] in ("Key", "CustomName") and not reload_pending:
+        if path.rsplit("/", 1)[-1] in ("Key", "CustomName", "DcSource") and not reload_pending:
             reload_pending.append(GLib.timeout_add(500, reload_settings))
 
     bus.add_signal_receiver(

@@ -26,8 +26,8 @@ switched, and the devices take no part in DVCC.
 SmartSolar, battery from the SmartShunt, and DC loads computed with the IP22
 charger's output.*
 
-**Status:** version 0.1.0. In daily use on a Raspberry Pi 4 with Venus OS
-v3.85 (large), with a SmartShunt, a SmartSolar MPPT and a Blue Smart IP22
+**Status:** version 0.1.0, tested in one installation: a Raspberry Pi 4 with
+Venus OS v3.85 (large), a SmartShunt, a SmartSolar MPPT and a Blue Smart IP22
 charger. Technical background: [docs/design.md](docs/design.md).
 
 ## How it works
@@ -113,7 +113,8 @@ C0:FF:EE:00:00:04  SmartShunt 1000A/50mV              battery monitor    -63    
 `victron-ble scan [seconds]` listens directly and lists the Victron devices in
 range, with or without a key, which helps to find MAC addresses. Devices whose
 Instant readout is still disabled are listed as *instant readout off*.
-`victron-ble forget <MAC>` removes a key.
+`victron-ble forget <MAC>` removes a key. `victron-ble dcsource <MAC> on`
+also shows an AC charger with its power on the overview page (see below).
 
 Changing a device's Bluetooth PIN code in VictronConnect also changes its
 encryption key. The device then shows as *wrong key* until you store the new
@@ -132,6 +133,7 @@ voltage sense.
 | battery | `/Dc/0/Voltage`, `/Dc/0/Current`, `/Dc/0/Power` (V × I), `/Soc`, `/ConsumedAmphours`, `/TimeToGo`; depending on the aux input `/Dc/1/Voltage` (starter battery), `/Dc/0/MidVoltage` and `/Dc/0/MidVoltageDeviation`, or `/Dc/0/Temperature`; from the alarm reason `/Alarms/LowVoltage`, `HighVoltage`, `LowSoc`, `LowStarterVoltage`, `HighStarterVoltage`, `LowTemperature`, `HighTemperature`, `MidVoltage` (0 ok, 2 alarm) |
 | solarcharger | `/State`, `/ErrorCode`, `/Dc/0/Voltage`, `/Dc/0/Current`, `/Yield/Power`, `/History/Daily/0/Yield`, `/Load/I`, `/Yield/User` |
 | charger | `/State`, `/ErrorCode`, `/Dc/0..2/Voltage`, `/Dc/0..2/Current`, `/NrOfOutputs`, `/Dc/0/Temperature`, `/Ac/In/L1/I` |
+| dcsource (optional, for AC chargers) | `/Settings/MonitorMode` = -2 (AC charger), `/Dc/0/Voltage`, `/Dc/0/Current` and `/Dc/0/Power` (all outputs together), `/Dc/0/Temperature` |
 
 A SmartShunt becomes the system battery monitor when it is the only one
 (Settings > System setup > Battery monitor: Automatic).
@@ -150,6 +152,26 @@ Quattro it reads *Off*, even while the charger is charging. Wired chargers
 behave the same way. Tap the widget to open the charger's own page. The
 charging current shows in the battery current, and the DC loads are computed
 from it.
+
+To see the charger with its power in the overview's left column, turn on
+`victron-ble dcsource <MAC> on`. The charger is then also published as a DC
+source of the type *AC charger* (`com.victronenergy.dcsource.victron_<mac>`),
+just like a SmartShunt in DC energy meter mode. gui-v2 draws an *AC charger*
+box for such a source.
+
+- systemcalc leaves DC sources out of the DC loads, and the DC source has no
+  energy counter. Nothing is counted twice.
+- VRM lists the charger twice, as a charger and as a DC meter.
+- The *Inverter / Charger* widget stays.
+- The box appears about 10 seconds after the charger. The DC source gets its
+  name with a delay, so that gui-v2 recognises it as an AC charger (see
+  [docs/design.md](docs/design.md)).
+
+`victron-ble dcsource <MAC> off` removes it again. The idea comes from
+[ChargerMeter](https://github.com/mebitek/ChargerMeter), which does the same
+for a wired IP22.
+
+![gui-v2 overview with the IP22 shown as AC charger](docs/img/overview.png)
 
 Not in the advertisements, so not available: PV voltage, history beyond
 today, firmware version, serial number, relay state and settings.
@@ -246,3 +268,7 @@ docs/design.md          design notes
   product name table.
 
 MIT license, see [LICENSE](LICENSE).
+
+This is an independent community project. It is not made, endorsed or
+supported by Victron Energy. Victron, Venus OS, SmartShunt, SmartSolar and Blue
+Smart are names of Victron Energy products. Use it at your own risk.

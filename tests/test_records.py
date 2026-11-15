@@ -199,6 +199,18 @@ class AcChargerTest(unittest.TestCase):
         self.assertEqual(v["/Dc/0/Temperature"], -5)
         self.assertEqual(v["/Ac/In/L1/I"], 4.2)
 
+    def test_dc_totals(self):
+        v = AC.decode(advgen.ac_charger(state=3, outputs=[(14.4, 10.0), (14.2, 5.0)], temperature=20))
+        totals = records.charger_dc_totals(v)
+        self.assertEqual(totals["/Dc/0/Voltage"], 14.4)
+        self.assertEqual(totals["/Dc/0/Current"], 15.0)
+        self.assertEqual(totals["/Dc/0/Power"], 215.0)
+        self.assertEqual(totals["/Dc/0/Temperature"], 20)
+        self.assertEqual(set(totals), set(records.DCSOURCE_PATHS))
+        empty = records.charger_dc_totals(AC.decode(advgen.ac_charger()))
+        self.assertIsNone(empty["/Dc/0/Power"])
+        self.assertIsNone(empty["/Dc/0/Current"])
+
 
 class AdvertisementTest(unittest.TestCase):
     def test_header(self):

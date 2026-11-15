@@ -31,6 +31,7 @@ MAX_UNCONFIGURED = 100  # Victron devices of others (marinas...) we keep track o
 FORGET_AFTER = 3600  # drop unconfigured devices not heard for this long
 STATE_SAVE_INTERVAL = 600  # write the yield counters to flash at most this often
 RETRY_NAME_TAKEN = 60
+MIRROR_GROUP_SUFFIX = "_dcsource"  # settings group of a charger's DC source service
 RETRY_ERROR = 30
 WRONG_KEY_LOG_INTERVAL = 600
 
@@ -79,13 +80,42 @@ def _text_formatter(fmt):
 
 
 class DeviceService:
-    """One com.victronenergy.<role>.victron_<mac> service on its own D-Bus
-    connection (every Venus service exports its paths at the object root)."""
+    """One com.victronenergy.<role>.<id> service on its own D-Bus connection
+    (every Venus service exports its paths at the object root).
 
-    def __init__(self, dev, decoder, instance, custom_name, on_custom_name, values):
-        self.role = decoder.role
+    paths: {path: text format} of the changing values, filled from values;
+    constants: {path: value} that never change; on_custom_name(service, name)
+    is called when /CustomName is written and returns True to accept it.
+
+    name_delay: publish /ProductName and /CustomName only this many seconds
+    later (see tick()). gui-v2 treats a service as a device once it has a
+    device instance and a name, and it creates the items of a new service in
+    alphabetical order. A DC source would thus become a device before its
+    /Settings/MonitorMode exists, and gui-v2 would show it as a generic
+    source for good. Without a name it waits until all items are there."""
+
+    def __init__(
+        self,
+        name,
+        role,
+        instance,
+        product_id,
+        product_name,
+        paths,
+        values,
+        custom_name="",
+        on_custom_name=None,
+        constants=None,
+        name_delay=0,
+    ):
+        self.role = role
         self.instance = instance
-        self.name = "com.victronenergy.%s.%s" % (decoder.role, dev.dev_id)
+        self.name = name
+        self._pending_names = None
+        if name_delay > 0:
+            self._pending_names = [product_name, custom_name or ""]
+            self._names_at = time.monotonic() + name_delay
+            product_name, custom_name = None, ""
         self._conn = dbus.bus.BusConnection(st.bus_type())
         # libdbus would otherwise _exit(1) the whole process when this
         # connection is closed again (device out of range, key removed...)
@@ -99,8 +129,8 @@ class DeviceService:
             # voltage for shared voltage sense (as for dbus-ble-sensors)
             svc.add_path("/Mgmt/InsecureConnection", 1)
             svc.add_path("/DeviceInstance", instance)
-            svc.add_path("/ProductId", dev.product_id)
-            svc.add_path("/ProductName", products.name(dev.product_id, decoder.generic_name))
+            svc.add_path("/ProductId", product_id)
+            svc.add_path("/ProductName", product_name)
             svc.add_path("/FirmwareVersion", None)
             svc.add_path("/HardwareVersion", None)
             svc.add_path("/Serial", None)
@@ -109,9 +139,11 @@ class DeviceService:
                 "/CustomName",
                 custom_name or "",
                 writeable=True,
-                onchangecallback=lambda path, value: on_custom_name(dev, value),
+                onchangecallback=lambda path, value: on_custom_name(self, value) if on_custom_name else True,
             )
-            for path, fmt in sorted(decoder.paths.items()):
+            for path, value in sorted((constants or {}).items()):
+                svc.add_path(path, value)
+            for path, fmt in sorted(paths.items()):
                 svc.add_path(path, values.get(path), gettextcallback=_text_formatter(fmt))
             svc.register()
         except Exception:
@@ -125,7 +157,19 @@ class DeviceService:
                 s[path] = value
 
     def set_custom_name(self, name):
-        self._svc["/CustomName"] = name
+        if self._pending_names is not None:
+            self._pending_names[1] = name
+        else:
+            self._svc["/CustomName"] = name
+
+    def tick(self, now):
+        """Publish delayed names when their time has come."""
+        if self._pending_names is not None and now >= self._names_at:
+            product_name, custom_name = self._pending_names
+            self._pending_names = None
+            with self._svc as s:
+                s["/ProductName"] = product_name
+                s["/CustomName"] = custom_name
 
     def close(self):
         self._svc.__del__()  # releases the bus name and unexports the paths
@@ -148,14 +192,17 @@ class Device:
         self.values = {}
         self.service = None
         self.retry_at = 0.0
+        self.mirror = None  # optional DC source service of an AC charger
+        self.mirror_retry_at = 0.0
         self.blocked = None  # why we must not publish it ourselves
         self.wrong_key_logged = -WRONG_KEY_LOG_INTERVAL
         self.yield_counter = None
 
 
 class Manager:
-    def __init__(self, bus, timeout=300, state_file=None, status_file=None):
+    def __init__(self, bus, timeout=300, state_file=None, status_file=None, mirror_name_delay=10):
         self.bus = bus
+        self.mirror_name_delay = mirror_name_delay
         self.settings = st.Settings(bus)
         self.timeout = timeout
         self.state_file = state_file
@@ -190,7 +237,11 @@ class Manager:
                 invalid.add(mac)
                 if mac not in self._invalid_keys:
                     log.warning("%s: ignoring the key setting, it must be 32 hex digits", mac)
-            config[mac] = {"key": key, "name": values.get("CustomName") or ""}
+            config[mac] = {
+                "key": key,
+                "name": values.get("CustomName") or "",
+                "dcsource": values.get("DcSource") == 1,
+            }
         self._invalid_keys = invalid
 
         for mac in sorted(set(config) | set(self.config)):
@@ -206,8 +257,13 @@ class Manager:
                 if dev.service is not None:
                     self._remove_service(dev, "key changed" if new.get("key") else "key removed")
             elif dev.service is not None and old.get("name") != new.get("name"):
-                dev.service.set_custom_name(new.get("name", ""))
+                for svc in (dev.service, dev.mirror):
+                    if svc is not None:
+                        svc.set_custom_name(new.get("name", ""))
         self.config = config
+        for dev in self.devices.values():
+            if dev.service is not None and bool(dev.mirror) != bool(config.get(dev.mac, {}).get("dcsource")):
+                self._update_mirror(dev, time.monotonic())
         return True
 
     def configured(self):
@@ -324,13 +380,23 @@ class Manager:
             self._remove_service(dev, "record type changed")
         if dev.service is not None:
             dev.service.update(values)
+            self._update_mirror(dev, now)
             return
         if now < dev.retry_at:
             return
         try:
             instance = self.settings.device_instance(dev.mac, decoder.role)
-            name = self.config.get(dev.mac, {}).get("name", "")
-            dev.service = DeviceService(dev, decoder, instance, name, self._custom_name_changed, values)
+            dev.service = DeviceService(
+                "com.victronenergy.%s.%s" % (decoder.role, dev.dev_id),
+                decoder.role,
+                instance,
+                dev.product_id,
+                products.name(dev.product_id, decoder.generic_name),
+                decoder.paths,
+                values,
+                custom_name=self.config.get(dev.mac, {}).get("name", ""),
+                on_custom_name=lambda svc, name: self._custom_name_changed(dev, svc, name),
+            )
         except dbus.exceptions.NameExistsException:
             dev.state = "name taken"
             dev.retry_at = now + RETRY_NAME_TAKEN
@@ -352,8 +418,52 @@ class Manager:
             dev.service.name,
             dev.service.instance,
         )
+        self._update_mirror(dev, now)
 
-    def _custom_name_changed(self, dev, name):
+    def _update_mirror(self, dev, now):
+        """An AC charger with DcSource = 1 in its settings is also published as
+        a DC source of the type AC charger, which gui-v2 shows with its power on
+        the overview page. systemcalc leaves DC sources out of the DC system
+        power, and without an energy counter VRM counts no energy twice; only
+        the VRM device list shows the charger twice."""
+        wanted = (
+            dev.service is not None
+            and dev.service.role == "charger"
+            and self.config.get(dev.mac, {}).get("dcsource")
+        )
+        if not wanted:
+            if dev.mirror is not None:
+                self._remove_mirror(dev, "DC source disabled")
+            return
+        values = records.charger_dc_totals(dev.values)
+        if dev.mirror is not None:
+            dev.mirror.update(values)
+            dev.mirror.tick(now)
+            return
+        if now < dev.mirror_retry_at:
+            return
+        try:
+            instance = self.settings.device_instance(dev.mac, "dcsource", group_suffix=MIRROR_GROUP_SUFFIX)
+            dev.mirror = DeviceService(
+                "com.victronenergy.dcsource.%s" % dev.dev_id,
+                "dcsource",
+                instance,
+                dev.product_id,
+                products.name(dev.product_id, records.AcCharger.generic_name),
+                records.DCSOURCE_PATHS,
+                values,
+                custom_name=self.config.get(dev.mac, {}).get("name", ""),
+                on_custom_name=lambda svc, name: self._custom_name_changed(dev, svc, name),
+                constants={"/Settings/MonitorMode": records.MONITOR_MODE_AC_CHARGER},
+                name_delay=self.mirror_name_delay,
+            )
+        except Exception as e:
+            dev.mirror_retry_at = now + RETRY_ERROR
+            log.warning("%s: cannot create the DC source service: %s", dev.mac, e)
+            return
+        log.info("%s: also published as %s (device instance %d)", dev.mac, dev.mirror.name, instance)
+
+    def _custom_name_changed(self, dev, source, name):
         name = str(name)
         try:
             self.settings.set_device_setting(dev.mac, "CustomName", name)
@@ -361,9 +471,22 @@ class Manager:
             log.warning("%s: cannot store the name: %s", dev.mac, e)
             return False
         self.config.setdefault(dev.mac, {"key": None})["name"] = name
+        for svc in (dev.service, dev.mirror):
+            if svc is not None and svc is not source:
+                svc.set_custom_name(name)
         return True
 
+    def _remove_mirror(self, dev, reason):
+        log.info("%s: removing %s (%s)", dev.mac, dev.mirror.name, reason)
+        try:
+            dev.mirror.close()
+        except Exception:
+            log.exception("%s: closing the DC source service failed", dev.mac)
+        dev.mirror = None
+
     def _remove_service(self, dev, reason):
+        if dev.mirror is not None:
+            self._remove_mirror(dev, reason)
         log.info("%s: removing %s (%s)", dev.mac, dev.service.name, reason)
         try:
             dev.service.close()
@@ -376,6 +499,8 @@ class Manager:
     def tick(self):
         now = time.monotonic()
         for mac, dev in list(self.devices.items()):
+            if dev.mirror is not None:
+                dev.mirror.tick(now)
             if dev.service is not None and now - dev.last_update > self.timeout:
                 self._remove_service(dev, "no data for %d s" % self.timeout)
                 dev.state = "no data"
@@ -427,6 +552,7 @@ class Manager:
                 "mac": mac,
                 "key": bool(conf.get("key")),
                 "name": conf.get("name", ""),
+                "dcsource": bool(conf.get("dcsource")),
             }
             if dev is None:
                 entry["state"] = "not seen"
@@ -444,6 +570,8 @@ class Manager:
                         "state": dev.state,
                         "service": dev.service.name if dev.service else None,
                         "instance": dev.service.instance if dev.service else None,
+                        "mirror": dev.mirror.name if dev.mirror else None,
+                        "mirror_instance": dev.mirror.instance if dev.mirror else None,
                         "values": dev.values if dev.service else {},
                     }
                 )

@@ -193,6 +193,8 @@ def main():
                 os.path.join(tmp, "state.json"),
                 "--status-file",
                 status_file,
+                "--dcsource-name-delay",
+                "1",
             ],
             stdout=daemon_log,
             stderr=subprocess.STDOUT,
@@ -248,6 +250,34 @@ def main():
         check(get(charger, "/DeviceInstance") == 20, "charger device instance 20")
         check(get(charger, "/ProductName") == "Blue Smart IP22 Charger 12/30 (1)", "charger product name")
 
+        print("AC charger as DC source (enabled while running):")
+        dcsource = "com.victronenergy.dcsource.victron_c0ffee000003"
+        check(not bus.name_has_owner(dcsource), "no DC source by default")
+        r = subprocess.run(cli + ["dcsource", IP22, "on"], capture_output=True, text=True)
+        check(r.returncode == 0, "victron-ble dcsource %s on" % IP22)
+        check(wait_for(lambda: bus.name_has_owner(dcsource), timeout=5), "service %s appears" % dcsource)
+        check(get(dcsource, "/Settings/MonitorMode") == -2, "monitor mode -2 (AC charger)")
+        check(abs(get(dcsource, "/Dc/0/Power") - 16.6) < 0.01, "DC source power 16.6 W (13.8 V x 1.2 A)")
+        check(
+            get(dcsource, "/Dc/0/Current") == 1.2 and get(dcsource, "/Dc/0/Voltage") == 13.8, "DC source V, I"
+        )
+        check(
+            wait_for(lambda: get(dcsource, "/ProductName") == "Blue Smart IP22 Charger 12/30 (1)", timeout=8),
+            "DC source product name (published a moment later)",
+        )
+        check(
+            "History/EnergyOut" not in get(dcsource, "/"), "no energy counter (VRM must not count it twice)"
+        )
+        check(
+            get(
+                "com.victronenergy.settings",
+                "/Settings/Devices/victron_c0ffee000003_dcsource/ClassAndVrmInstance",
+            )
+            == "dcsource:20",
+            "own VRM instance dcsource:20",
+        )
+        check(bus.name_has_owner(charger), "charger service still there")
+
         print("solar charger (key added while running):")
         time.sleep(1.5)
         check(not bus.name_has_owner(solar), "not published without a key")
@@ -278,6 +308,7 @@ def main():
             "battery service removed after the data stops",
         )
         check(wait_for(lambda: not bus.name_has_owner(charger), timeout=10), "charger service removed")
+        check(wait_for(lambda: not bus.name_has_owner(dcsource), timeout=5), "DC source removed with it")
 
         daemon.send_signal(signal.SIGTERM)
         rc = daemon.wait(timeout=10)

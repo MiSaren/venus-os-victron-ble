@@ -32,36 +32,60 @@ class FakeSettings:
     def set_device_setting(self, mac, name, value):
         self.devices.setdefault(mac, {})[name] = value
 
-    def device_instance(self, mac, role, default=20):
+    def device_instance(self, mac, role, default=20, group_suffix=""):
+        group = mac + group_suffix
         taken = {i for (r, i) in self.instances.values() if r == role}
-        if mac not in self.instances or self.instances[mac][0] != role:
+        if group not in self.instances or self.instances[group][0] != role:
             instance = default
             while instance in taken:
                 instance += 1
-            self.instances[mac] = (role, instance)
-        return self.instances[mac][1]
+            self.instances[group] = (role, instance)
+        return self.instances[group][1]
 
 
 class FakeService:
     created = []
 
-    def __init__(self, dev, decoder, instance, custom_name, on_custom_name, values):
-        self.role = decoder.role
+    def __init__(
+        self,
+        name,
+        role,
+        instance,
+        product_id,
+        product_name,
+        paths,
+        values,
+        custom_name="",
+        on_custom_name=None,
+        constants=None,
+        name_delay=0,
+    ):
+        assert set(values) <= set(paths), "values for unknown paths: %s" % (set(values) - set(paths))
+        self.name_delay = name_delay
+        self.ticks = 0
+        self.role = role
         self.instance = instance
-        self.name = "com.victronenergy.%s.%s" % (decoder.role, dev.dev_id)
+        self.name = name
+        self.product_name = product_name
+        self.paths = paths
+        self.constants = constants or {}
         self.values = dict(values)
         self.custom_name = custom_name
-        self.on_custom_name = lambda name: on_custom_name(dev, name)
+        self.on_custom_name = lambda name: on_custom_name(self, name)
         self.updates = 0
         self.closed = False
         FakeService.created.append(self)
 
     def update(self, values):
+        assert set(values) <= set(self.paths), "unknown paths: %s" % (set(values) - set(self.paths))
         self.values.update(values)
         self.updates += 1
 
     def set_custom_name(self, name):
         self.custom_name = name
+
+    def tick(self, now):
+        self.ticks += 1
 
     def close(self):
         self.closed = True
@@ -316,6 +340,86 @@ class ManagerTest(unittest.TestCase):
         shunt = [d for d in status["devices"] if d["mac"] == SHUNT][0]
         self.assertEqual(shunt["values"]["/Soc"], 80.0)
         self.assertEqual(shunt["service"], "com.victronenergy.battery.victron_c0ffee000001")
+
+    # ---- DC source of an AC charger (gui-v2 overview) ----
+
+    def ip22(self, nonce, outputs=((14.2, 29.4),), state=3):
+        return adv(
+            IP22,
+            0xA330,
+            records.AC_CHARGER,
+            nonce,
+            advgen.ac_charger(state=state, outputs=list(outputs), temperature=25),
+        )
+
+    def test_dcsource_off_by_default(self):
+        self.settings.set_device_setting(IP22, "Key", KEY.hex())
+        self.m.reload_config()
+        self.m.on_advertisement(IP22, -60, self.ip22(1))
+        self.assertEqual([s.role for s in FakeService.created], ["charger"])
+
+    def test_dcsource_mirror(self):
+        self.settings.set_device_setting(IP22, "Key", KEY.hex())
+        self.settings.set_device_setting(IP22, "DcSource", 1)
+        self.settings.set_device_setting(IP22, "CustomName", "Shore charger")
+        self.m.reload_config()
+        self.m.on_advertisement(IP22, -60, self.ip22(1))
+        charger, mirror = FakeService.created
+        self.assertEqual(mirror.name, "com.victronenergy.dcsource.victron_c0ffee000003")
+        self.assertEqual((mirror.role, mirror.instance), ("dcsource", 20))
+        self.assertEqual(mirror.constants, {"/Settings/MonitorMode": -2})
+        self.assertEqual(mirror.name_delay, 10)  # names come later, see DeviceService
+        self.assertEqual(charger.name_delay, 0)
+        self.assertEqual(mirror.product_name, "Blue Smart IP22 Charger 12/30 (1)")
+        self.assertEqual(mirror.custom_name, "Shore charger")
+        self.assertEqual(mirror.values["/Dc/0/Voltage"], 14.2)
+        self.assertEqual(mirror.values["/Dc/0/Current"], 29.4)
+        self.assertEqual(mirror.values["/Dc/0/Power"], round(14.2 * 29.4, 1))
+        self.assertNotIn("/History/EnergyOut", mirror.values)  # VRM must not count the energy twice
+        self.m.on_advertisement(IP22, -60, self.ip22(2, outputs=[(14.4, 10.0)]))
+        self.assertEqual(mirror.values["/Dc/0/Power"], 144.0)
+        self.assertEqual(charger.values["/Dc/0/Current"], 10.0)
+        # gone together with the charger
+        self.clock.now += 301
+        self.m.tick()
+        self.assertTrue(charger.closed and mirror.closed)
+        self.assertIsNone(self.m.devices[IP22].mirror)
+
+    def test_dcsource_toggle_at_runtime(self):
+        self.settings.set_device_setting(IP22, "Key", KEY.hex())
+        self.m.reload_config()
+        self.m.on_advertisement(IP22, -60, self.ip22(1))
+        self.settings.set_device_setting(IP22, "DcSource", 1)
+        self.m.reload_config()  # appears right away, without waiting for new data
+        charger, mirror = FakeService.created
+        self.assertEqual(mirror.values["/Dc/0/Power"], round(14.2 * 29.4, 1))
+        self.settings.set_device_setting(IP22, "DcSource", 0)
+        self.m.reload_config()
+        self.assertTrue(mirror.closed)
+        self.assertFalse(charger.closed)
+
+    def test_dcsource_only_for_chargers(self):
+        self.settings.set_device_setting(SHUNT, "Key", KEY.hex())
+        self.settings.set_device_setting(SHUNT, "DcSource", 1)
+        self.m.reload_config()
+        self.m.on_advertisement(SHUNT, -70, self.shunt(1))
+        self.assertEqual([s.role for s in FakeService.created], ["battery"])
+
+    def test_dcsource_rename_and_instances(self):
+        self.settings.set_device_setting(IP22, "Key", KEY.hex())
+        self.settings.set_device_setting(IP22, "DcSource", 1)
+        self.m.reload_config()
+        self.m.on_advertisement(IP22, -60, self.ip22(1))
+        charger, mirror = FakeService.created
+        self.assertTrue(mirror.on_custom_name("Shore"))  # renamed on the DC source page
+        self.assertEqual(charger.custom_name, "Shore")
+        self.assertEqual(self.settings.devices[IP22]["CustomName"], "Shore")
+        self.assertEqual(
+            self.settings.instances, {IP22: ("charger", 20), IP22 + "_dcsource": ("dcsource", 20)}
+        )
+        status = self.m.status()["devices"][0]
+        self.assertEqual(status["mirror"], mirror.name)
+        self.assertTrue(status["dcsource"])
 
 
 class YieldCounterTest(unittest.TestCase):
