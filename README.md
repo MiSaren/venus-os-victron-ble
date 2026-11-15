@@ -65,12 +65,12 @@ GX devices with Bluetooth. Root access via SSH is needed to install it.
 
 ## Install
 
-Build the package on a computer with a clone of this repository, copy it to
-the Venus device and run the installer:
+Download `venus-os-victron-ble-0.1.0.tar.gz` from the
+[latest release](https://github.com/MiSaren/venus-os-victron-ble/releases/latest),
+copy it to the Venus device and run the installer:
 
 ```sh
-tools/dist.sh                                   # -> dist/venus-os-victron-ble-0.1.0.tar.gz
-scp dist/venus-os-victron-ble-0.1.0.tar.gz root@venus.local:/tmp/
+scp venus-os-victron-ble-0.1.0.tar.gz root@venus.local:/tmp/
 ssh root@venus.local
 cd /tmp && tar -xzf venus-os-victron-ble-0.1.0.tar.gz && victron-ble/install.sh
 ```
@@ -78,6 +78,9 @@ cd /tmp && tar -xzf venus-os-victron-ble-0.1.0.tar.gz && victron-ble/install.sh
 The installer copies everything to `/data/victron-ble`, adds the boot hook
 to `/data/rcS.local` and starts the service. Running it again updates an
 installation.
+
+To build the package yourself from a clone of this repository, run
+`tools/dist.sh`. It writes the package to `dist/`.
 
 ## Add your devices
 
