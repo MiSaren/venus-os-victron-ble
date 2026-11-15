@@ -14,7 +14,8 @@ import dbus
 
 from vedbus import VeDbusService
 
-from . import PROCESS_NAME, VERSION, aes, hci, products, records
+from . import PROCESS_NAME, VERSION, aes, hci, pins, products, records
+from . import control as ctl
 from . import settings as st
 
 log = logging.getLogger("manager")
@@ -32,6 +33,7 @@ FORGET_AFTER = 3600  # drop unconfigured devices not heard for this long
 STATE_SAVE_INTERVAL = 600  # write the yield counters to flash at most this often
 RETRY_NAME_TAKEN = 60
 MIRROR_GROUP_SUFFIX = "_dcsource"  # settings group of a charger's DC source service
+SWITCH_GROUP_SUFFIX = "_switch"  # settings group of a charger's night mode switch service
 RETRY_ERROR = 30
 WRONG_KEY_LOG_INTERVAL = 600
 
@@ -194,15 +196,33 @@ class Device:
         self.retry_at = 0.0
         self.mirror = None  # optional DC source service of an AC charger
         self.mirror_retry_at = 0.0
+        self.switch = None  # optional night mode switch service of an AC charger
+        self.switch_retry_at = 0.0
         self.blocked = None  # why we must not publish it ourselves
         self.wrong_key_logged = -WRONG_KEY_LOG_INTERVAL
         self.yield_counter = None
 
 
 class Manager:
-    def __init__(self, bus, timeout=300, state_file=None, status_file=None, mirror_name_delay=10):
+    def __init__(
+        self,
+        bus,
+        timeout=300,
+        state_file=None,
+        status_file=None,
+        mirror_name_delay=10,
+        runner=None,
+        pins_file=None,
+        control_poll=ctl.POLL_INTERVAL,
+    ):
         self.bus = bus
         self.mirror_name_delay = mirror_name_delay
+        self.runner = runner  # helper runner for night mode control; None = no control
+        self.pins_file = pins_file
+        self.control_poll = control_poll
+        self.control_macs = set()  # chargers with a PIN
+        self.controls = {}  # mac -> ChargerControl
+        self._pins_mtime = "unread"
         self.settings = st.Settings(bus)
         self.timeout = timeout
         self.state_file = state_file
@@ -241,6 +261,10 @@ class Manager:
                 "key": key,
                 "name": values.get("CustomName") or "",
                 "dcsource": values.get("DcSource") == 1,
+                "switch": {
+                    path: values.get(name, default) if values.get(name) is not None else default
+                    for path, (name, default) in ctl.OUTPUT_SETTINGS.items()
+                },
             }
         self._invalid_keys = invalid
 
@@ -257,14 +281,35 @@ class Manager:
                 if dev.service is not None:
                     self._remove_service(dev, "key changed" if new.get("key") else "key removed")
             elif dev.service is not None and old.get("name") != new.get("name"):
-                for svc in (dev.service, dev.mirror):
+                for svc in (dev.service, dev.mirror, dev.switch):
                     if svc is not None:
                         svc.set_custom_name(new.get("name", ""))
         self.config = config
         for dev in self.devices.values():
             if dev.service is not None and bool(dev.mirror) != bool(config.get(dev.mac, {}).get("dcsource")):
                 self._update_mirror(dev, time.monotonic())
+        self.reload_pins()
         return True
+
+    def reload_pins(self):
+        """Which chargers are controlled: those with a PIN in pins.json (the
+        PINs themselves stay in that file, the helper reads them)."""
+        if not self.pins_file:
+            return
+        try:
+            mtime = os.stat(self.pins_file).st_mtime_ns
+        except OSError:
+            mtime = None
+        if mtime == self._pins_mtime:
+            return
+        self._pins_mtime = mtime
+        macs = pins.macs(self.pins_file) if mtime is not None else set()
+        for mac in sorted(macs ^ self.control_macs):
+            log.info("%s: night mode control %s", mac, "enabled" if mac in macs else "disabled")
+        self.control_macs = macs
+        now = time.monotonic()
+        for dev in self.devices.values():
+            self._update_control(dev, now)
 
     def configured(self):
         return sorted(mac for mac, c in self.config.items() if c.get("key"))
@@ -381,6 +426,7 @@ class Manager:
         if dev.service is not None:
             dev.service.update(values)
             self._update_mirror(dev, now)
+            self._update_control(dev, now)
             return
         if now < dev.retry_at:
             return
@@ -419,6 +465,7 @@ class Manager:
             dev.service.instance,
         )
         self._update_mirror(dev, now)
+        self._update_control(dev, now)
 
     def _update_mirror(self, dev, now):
         """An AC charger with DcSource = 1 in its settings is also published as
@@ -471,10 +518,117 @@ class Manager:
             log.warning("%s: cannot store the name: %s", dev.mac, e)
             return False
         self.config.setdefault(dev.mac, {"key": None})["name"] = name
-        for svc in (dev.service, dev.mirror):
+        for svc in (dev.service, dev.mirror, dev.switch):
             if svc is not None and svc is not source:
                 svc.set_custom_name(name)
         return True
+
+    # ---- night mode control ---------------------------------------------
+
+    def _update_control(self, dev, now):
+        """A charger with a PIN gets a ChargerControl, and a switch service
+        once its night mode has been read."""
+        wanted = (
+            self.runner is not None
+            and dev.service is not None
+            and dev.service.role == "charger"
+            and dev.mac in self.control_macs
+        )
+        control = self.controls.get(dev.mac)
+        if not wanted:
+            if control is not None:
+                control.close()
+                del self.controls[dev.mac]
+            if dev.switch is not None:
+                self._remove_switch(dev, "night mode control off" if dev.service else "charger gone")
+            return
+        if control is None:
+            control = self.controls[dev.mac] = ctl.ChargerControl(
+                dev.mac,
+                self.runner,
+                now,
+                poll_interval=self.control_poll,
+                on_change=lambda c: self._control_changed(dev),
+            )
+            log.info("%s: night mode control on, reading the charger", dev.mac)
+        control.tick(now)
+        if dev.switch is None:
+            self._sync_switch(dev, now)
+
+    def _control_changed(self, dev):
+        self._sync_switch(dev, time.monotonic())
+        self.write_status()
+
+    def _sync_switch(self, dev, now):
+        control = self.controls.get(dev.mac)
+        if control is None or control.unsupported or dev.service is None:
+            if dev.switch is not None:
+                self._remove_switch(dev, control.error if control else "night mode control off")
+            return
+        if dev.switch is not None:
+            dev.switch.set_state(control.state, control.status)
+            return
+        if control.night is None or now < dev.switch_retry_at:
+            return  # gui-v2 only shows a switch with a valid state: publish once read
+        conf = self.config.get(dev.mac, {})
+        try:
+            instance = self.settings.device_instance(dev.mac, "switch", group_suffix=SWITCH_GROUP_SUFFIX)
+            dev.switch = ctl.SwitchService(
+                "com.victronenergy.switch.%s" % dev.dev_id,
+                instance,
+                dev.product_id,
+                products.name(dev.product_id, records.AcCharger.generic_name),
+                conf.get("name", ""),
+                conf.get("switch") or {},
+                on_state=lambda value: self._switch_written(dev, value),
+                on_output_setting=lambda path, value: self._switch_setting_written(dev, path, value),
+                on_custom_name=lambda svc, name: self._custom_name_changed(dev, svc, name),
+                state=control.state,
+                status=control.status,
+            )
+        except Exception as e:
+            dev.switch_retry_at = now + RETRY_ERROR
+            log.warning("%s: cannot create the switch service: %s", dev.mac, e)
+            return
+        log.info(
+            "%s: night mode switch published as %s (device instance %d)", dev.mac, dev.switch.name, instance
+        )
+
+    def _switch_written(self, dev, value):
+        """/SwitchableOutput/night/State written (gui-v2, Node-RED, VRM)."""
+        control = self.controls.get(dev.mac)
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return False
+        if control is None or control.unsupported or value not in (0, 1):
+            return False
+        log.info("%s: night mode %s requested", dev.mac, "on" if value else "off")
+        control.request(bool(value), time.monotonic())
+        self.write_status()
+        return True
+
+    def _switch_setting_written(self, dev, path, value):
+        name, default = ctl.OUTPUT_SETTINGS[path]
+        try:
+            value = int(value) if isinstance(default, int) else str(value)
+        except (TypeError, ValueError):
+            return False
+        try:
+            self.settings.set_device_setting(dev.mac, name, value)
+        except Exception as e:
+            log.warning("%s: cannot store %s: %s", dev.mac, name, e)
+            return False
+        self.config.setdefault(dev.mac, {"key": None}).setdefault("switch", {})[path] = value
+        return True
+
+    def _remove_switch(self, dev, reason):
+        log.info("%s: removing %s (%s)", dev.mac, dev.switch.name, reason)
+        try:
+            dev.switch.close()
+        except Exception:
+            log.exception("%s: closing the switch service failed", dev.mac)
+        dev.switch = None
 
     def _remove_mirror(self, dev, reason):
         log.info("%s: removing %s (%s)", dev.mac, dev.mirror.name, reason)
@@ -485,6 +639,11 @@ class Manager:
         dev.mirror = None
 
     def _remove_service(self, dev, reason):
+        control = self.controls.pop(dev.mac, None)
+        if control is not None:
+            control.close()
+        if dev.switch is not None:
+            self._remove_switch(dev, reason)
         if dev.mirror is not None:
             self._remove_mirror(dev, reason)
         log.info("%s: removing %s (%s)", dev.mac, dev.service.name, reason)
@@ -498,6 +657,12 @@ class Manager:
 
     def tick(self):
         now = time.monotonic()
+        self.reload_pins()
+        for mac, control in list(self.controls.items()):
+            control.tick(now)
+            dev = self.devices.get(mac)
+            if dev is not None and dev.switch is None:
+                self._sync_switch(dev, now)
         for mac, dev in list(self.devices.items()):
             if dev.mirror is not None:
                 dev.mirror.tick(now)
@@ -511,6 +676,8 @@ class Manager:
         self.write_status()
 
     def shutdown(self):
+        if self.runner is not None:
+            self.runner.stop()
         for dev in self.devices.values():
             if dev.service is not None:
                 self._remove_service(dev, "shutting down")
@@ -575,6 +742,10 @@ class Manager:
                         "values": dev.values if dev.service else {},
                     }
                 )
+            if mac in self.control_macs:
+                control = self.controls.get(mac)
+                entry["control"] = control.info(now) if control else {"waiting": "charger not published"}
+                entry["control"]["switch"] = dev.switch.name if dev is not None and dev.switch else None
             devs.append(entry)
         return {
             "version": VERSION,

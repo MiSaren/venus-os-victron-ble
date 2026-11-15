@@ -38,7 +38,7 @@ KEYS = {
     STRANGER: aes.parse_key("3132333435363738393a3b3c3d3e3f40"),
     WRONG: aes.parse_key("4142434445464748494a4b4c4d4e4f50"),
 }
-REPLAY_SECONDS = 12
+REPLAY_SECONDS = 30
 TIMEOUT = 4
 
 BUS_CONFIG = """<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
@@ -177,6 +177,17 @@ def main():
             r = subprocess.run(cli + ["key", mac, key.hex()], capture_output=True, text=True)
             check(r.returncode == 0, "victron-ble key %s" % mac)
 
+        pins_file = os.path.join(tmp, "pins.json")
+        fake_state = os.path.join(tmp, "fake-charger.json")
+        r = subprocess.run(
+            cli + ["--pins-file", pins_file, "control", IP22, "on"],
+            input="123456\n",
+            capture_output=True,
+            text=True,
+        )
+        check(r.returncode == 0, "victron-ble control %s on (PIN from stdin)" % IP22)
+        check(os.stat(pins_file).st_mode & 0o777 == 0o600, "pins.json readable by root only")
+
         replay = os.path.join(tmp, "replay.txt")
         write_replay(replay)
         daemon_log = open(os.path.join(tmp, "daemon.log"), "w")
@@ -195,6 +206,12 @@ def main():
                 status_file,
                 "--dcsource-name-delay",
                 "1",
+                "--pins-file",
+                pins_file,
+                "--control-helper",
+                "%s %s --state-file %s" % (sys.executable, os.path.join(HERE, "fake_vesmart.py"), fake_state),
+                "--control-poll",
+                "3600",
             ],
             stdout=daemon_log,
             stderr=subprocess.STDOUT,
@@ -249,6 +266,52 @@ def main():
         check(get(charger, "/Dc/0/Temperature") == 24, "temperature 24")
         check(get(charger, "/DeviceInstance") == 20, "charger device instance 20")
         check(get(charger, "/ProductName") == "Blue Smart IP22 Charger 12/30 (1)", "charger product name")
+
+        print("night mode switch:")
+        switch = "com.victronenergy.switch.victron_c0ffee000003"
+        night = "/SwitchableOutput/night"
+        check(
+            wait_for(lambda: bus.name_has_owner(switch), timeout=20),
+            "service %s after the first read" % switch,
+        )
+        check(get(switch, night + "/State") == 0 and get(switch, night + "/Status") == 0, "night mode off")
+        check(get(switch, night + "/Name") == "Night mode", "output name 'Night mode'")
+        check(
+            get(switch, night + "/Settings/Type") == 1 and get(switch, night + "/Settings/ValidTypes") == 2,
+            "a toggle, nothing else",
+        )
+        check(
+            get(switch, "/State") == 256 and get(switch, "/DeviceInstance") == 20, "device state, instance 20"
+        )
+        check(get(switch, "/ProductName") == "Blue Smart IP22 Charger 12/30 (1)", "switch product name")
+        check(setv(switch, night + "/State", 1) == 0, "switch on (written as gui-v2 does)")
+        check(
+            wait_for(lambda: get(switch, night + "/Status") == 9, timeout=10), "status on after the session"
+        )
+        check(json.load(open(fake_state))["mode"] == 2, "the charger is in night mode")
+        r = subprocess.run(
+            cli + ["--status-file", status_file, "night", IP22, "off"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        check(r.returncode == 0 and "night mode is off" in r.stdout, "victron-ble night %s off" % IP22)
+        check(get(switch, night + "/State") == 0 and json.load(open(fake_state))["mode"] == 0, "switched off")
+        check(setv(switch, night + "/State", 5) != 0, "an invalid state is refused")
+        check(setv(switch, night + "/Settings/CustomName", "Yotila") == 0, "output renamed")
+        check(
+            get("com.victronenergy.settings", "/Settings/Devices/victron_c0ffee000003/NightModeCustomName")
+            == "Yotila",
+            "output name stored in the settings",
+        )
+        check(
+            json.load(open(fake_state))["sessions"] == ["read", "night-on", "night-off"],
+            "Bluetooth sessions: read, night-on, night-off",
+        )
+        r = subprocess.run(
+            cli + ["--status-file", status_file, "night", IP22], capture_output=True, text=True
+        )
+        check(r.returncode == 0 and "off (max 30.0 A)" in r.stdout, "victron-ble night %s (status)" % IP22)
 
         print("AC charger as DC source (enabled while running):")
         dcsource = "com.victronenergy.dcsource.victron_c0ffee000003"
@@ -309,6 +372,9 @@ def main():
         )
         check(wait_for(lambda: not bus.name_has_owner(charger), timeout=10), "charger service removed")
         check(wait_for(lambda: not bus.name_has_owner(dcsource), timeout=5), "DC source removed with it")
+        check(
+            wait_for(lambda: not bus.name_has_owner(switch), timeout=5), "night mode switch removed with it"
+        )
 
         daemon.send_signal(signal.SIGTERM)
         rc = daemon.wait(timeout=10)

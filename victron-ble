@@ -8,12 +8,16 @@
   victron-ble forget MAC          remove the key; the device is no longer published
   victron-ble dcsource MAC on|off AC charger: also publish it as a DC source, so
                                   that the gui-v2 overview shows it with its power
+  victron-ble control MAC on|off  Blue Smart charger: switch its night mode from
+                                  Venus (asks for the charger's Bluetooth PIN)
+  victron-ble night MAC [on|off]  show or switch the night mode
 
 The key: VictronConnect > the device > settings (gear) > menu > Product info >
 Instant readout via Bluetooth: Enable, then "Show" next to the encryption data.
 """
 
 import argparse
+import getpass
 import json
 import os
 import select
@@ -24,10 +28,12 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(1, os.path.join(HERE, "ext", "velib_python"))
 sys.path.insert(1, HERE)
 
-from victronble import aes, hci, products, records  # noqa: E402
+from victronble import aes, hci, pins, products, records  # noqa: E402
 from victronble import settings as st  # noqa: E402
 
 STATUS_FILE = "/run/dbus-victron-ble/status.json"
+PINS_FILE = os.path.join(HERE, "pins.json")
+SWITCH_STATE = "/SwitchableOutput/night/State"
 
 STATE_TEXT = {
     0: "off",
@@ -158,6 +164,33 @@ def cmd_status(args):
             )
         elif d.get("dcsource") and d.get("record_type") not in (None, records.AC_CHARGER):
             print("%19sDcSource is set, but only AC chargers are published as a DC source" % "")
+        if d.get("control"):
+            print("%19s%s" % ("night mode: ", control_summary(d["control"])))
+
+
+def control_summary(c):
+    if c.get("waiting"):
+        return "waiting (%s)" % c["waiting"]
+    if c.get("unsupported"):
+        return "not supported by this charger (%s)" % c.get("error")
+    state = {None: "unknown", True: "on", False: "off"}[c.get("night")]
+    parts = [state]
+    if c.get("max_current") is not None:
+        parts[0] += " (max %.1f A)" % c["max_current"]
+    if c.get("requested") is not None and c.get("requested") != c.get("night"):
+        parts.append("switching %s" % ("on" if c["requested"] else "off"))
+    elif c.get("busy"):
+        parts.append("reading")
+    if c.get("last_ok_ago") is not None:
+        parts.append("read %s ago" % ago(c["last_ok_ago"]))
+    if c.get("error"):
+        parts.append("last attempt failed: %s" % c["error"])
+    parts.append(c["switch"] if c.get("switch") else "switch not published yet")
+    return ", ".join(parts)
+
+
+def ago(seconds):
+    return "%d s" % seconds if seconds < 120 else "%d min" % (seconds // 60)
 
 
 def cmd_scan(args):
@@ -256,6 +289,101 @@ def cmd_forget(args):
     print("%s: key removed, the device is no longer published" % mac)
 
 
+def read_pin(mac):
+    if sys.stdin.isatty():
+        text = getpass.getpass("Bluetooth PIN of %s (as in VictronConnect, 6 digits): " % mac)
+    else:
+        text = sys.stdin.readline()
+    pin = pins.valid_pin(text)
+    if pin is None:
+        die("the PIN must be 6 digits")
+    return pin
+
+
+def remove_bond(mac):
+    """Forget the pairing in bluetoothd (best effort)."""
+    import dbus
+
+    path = "/org/bluez/hci0/dev_" + mac.replace(":", "_")
+    try:
+        bus = dbus.SystemBus()
+        adapter = dbus.Interface(bus.get_object("org.bluez", "/org/bluez/hci0"), "org.bluez.Adapter1")
+        adapter.RemoveDevice(path)
+        return True
+    except dbus.exceptions.DBusException:
+        return False
+
+
+def cmd_control(args):
+    mac = mac_arg(args.mac)
+    stored = pins.load(args.pins_file)
+    if args.state == "on":
+        stored[mac] = read_pin(mac)
+        pins.save(args.pins_file, stored)
+        print("%s: night mode control on (PIN stored in %s, readable by root only)." % (mac, args.pins_file))
+        print("The charger is read within a minute; then a 'Night mode' switch appears in the")
+        print("gui-v2 switch pane. Check with: victron-ble")
+    else:
+        stored.pop(mac, None)
+        pins.save(args.pins_file, stored)
+        bond = remove_bond(mac)
+        print("%s: night mode control off, PIN removed%s." % (mac, ", pairing removed" if bond else ""))
+
+
+def load_status(args):
+    try:
+        with open(args.status_file) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        die("no status (%s): is dbus-victron-ble running?" % args.status_file)
+
+
+def control_entry(args, mac):
+    for d in load_status(args).get("devices") or []:
+        if d.get("mac") == mac:
+            return d.get("control")
+    return None
+
+
+def cmd_night(args):
+    mac = mac_arg(args.mac)
+    c = control_entry(args, mac)
+    if c is None:
+        die("%s: night mode control is off; enable it with: victron-ble control %s on" % (mac, mac))
+    if args.state is None:
+        print("%s: night mode %s" % (mac, control_summary(c)))
+        return
+    want = args.state == "on"
+    if c.get("night") == want and not c.get("busy") and c.get("requested") is None:
+        print("%s: night mode is already %s" % (mac, args.state))
+        return
+    if not c.get("switch"):
+        die("%s: the switch is not published yet (%s)" % (mac, control_summary(c)))
+    import dbus
+
+    started = time.time()
+    try:
+        bus = dbus.SessionBus() if st.bus_type() == dbus.bus.BUS_SESSION else dbus.SystemBus()
+        item = bus.get_object(c["switch"], SWITCH_STATE, introspect=False)
+        if item.SetValue(dbus.Int32(1 if want else 0), dbus_interface=st.BUSITEM, timeout=10) != 0:
+            die("the switch refused the value")
+    except dbus.exceptions.DBusException as e:
+        die("cannot switch: %s" % (e.get_dbus_message() or e))
+    print("%s: switching night mode %s ..." % (mac, args.state))
+    deadline = time.monotonic() + 150
+    while time.monotonic() < deadline:
+        time.sleep(1)
+        c = control_entry(args, mac) or {}
+        if (c.get("last_done") or 0) >= started and not c.get("busy"):
+            break
+    else:
+        die("no result yet; see 'victron-ble' and the log /var/log/dbus-victron-ble/current")
+    if c.get("night") == want and not c.get("error"):
+        print("%s: night mode is %s" % (mac, args.state))
+    else:
+        die("%s: switching failed: %s" % (mac, control_summary(c)))
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="victron-ble",
@@ -264,6 +392,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--status-file", default=STATUS_FILE, help=argparse.SUPPRESS)
+    parser.add_argument("--pins-file", default=PINS_FILE, help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="cmd")
     sub.add_parser("status", help="show devices and published services")
     p = sub.add_parser("scan", help="listen for Victron devices directly")
@@ -279,6 +408,12 @@ def main():
     p = sub.add_parser("dcsource", help="AC charger: also publish it as a DC source (gui-v2 overview)")
     p.add_argument("mac")
     p.add_argument("state", choices=["on", "off"])
+    p = sub.add_parser("control", help="Blue Smart charger: night mode control on/off (PIN from stdin)")
+    p.add_argument("mac")
+    p.add_argument("state", choices=["on", "off"])
+    p = sub.add_parser("night", help="show or switch the night mode of a controlled charger")
+    p.add_argument("mac")
+    p.add_argument("state", nargs="?", choices=["on", "off"])
     args = parser.parse_args()
     commands = {
         "scan": cmd_scan,
@@ -286,6 +421,8 @@ def main():
         "name": cmd_name,
         "forget": cmd_forget,
         "dcsource": cmd_dcsource,
+        "control": cmd_control,
+        "night": cmd_night,
     }
     commands.get(args.cmd, cmd_status)(args)
 

@@ -12,7 +12,8 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(HERE, "..", "ext", "velib_python"))
 
 import advgen  # noqa: E402
-from victronble import aes, manager, records  # noqa: E402
+from victronble import aes, manager, pins, records  # noqa: E402
+from victronble import control as ctl  # noqa: E402
 
 KEY = aes.parse_key("00112233445566778899aabbccddeeff")
 OTHER_KEY = aes.parse_key("ff112233445566778899aabbccddeeff")
@@ -420,6 +421,237 @@ class ManagerTest(unittest.TestCase):
         status = self.m.status()["devices"][0]
         self.assertEqual(status["mirror"], mirror.name)
         self.assertTrue(status["dcsource"])
+
+
+class FakeSwitch:
+    created = []
+
+    def __init__(
+        self,
+        name,
+        instance,
+        product_id,
+        product_name,
+        custom_name,
+        output_settings,
+        on_state,
+        on_output_setting,
+        on_custom_name,
+        state,
+        status,
+    ):
+        self.name = name
+        self.instance = instance
+        self.product_name = product_name
+        self.custom_name = custom_name
+        self.output_settings = dict(output_settings)
+        self.on_state = on_state
+        self.on_output_setting = on_output_setting
+        self.on_custom_name = lambda name: on_custom_name(self, name)
+        self.state, self.status = state, status
+        self.closed = False
+        FakeSwitch.created.append(self)
+
+    def set_state(self, state, status):
+        self.state, self.status = state, status
+
+    def set_custom_name(self, name):
+        self.custom_name = name
+
+    def close(self):
+        self.closed = True
+
+
+class FakeRunner:
+    def __init__(self):
+        self.jobs = []
+        self.stopped = False
+
+    def submit(self, mac, op, callback):
+        self.jobs.append([mac, op, callback])
+
+    def finish(self, result):
+        mac, op, callback = self.jobs.pop(0)
+        callback(dict(result))
+        return op
+
+    def stop(self):
+        self.stopped = True
+
+
+OFF = {"ok": True, "night": False, "mode": 0, "max_current": 30.0}
+ON = {"ok": True, "night": True, "mode": 2, "max_current": 15.0}
+NIGHT_STATE = ctl.OUTPUT_PATH + "/State"
+
+
+class NightModeTest(unittest.TestCase):
+    """The night mode switch of an AC charger with a PIN."""
+
+    def setUp(self):
+        FakeService.created = []
+        FakeSwitch.created = []
+        self.clock = Clock()
+        for p in (
+            mock.patch.object(manager, "DeviceService", FakeService),
+            mock.patch.object(ctl, "SwitchService", FakeSwitch),
+            mock.patch.object(manager.time, "monotonic", self.clock),
+            mock.patch.object(ctl.time, "monotonic", self.clock),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.pins_file = os.path.join(self.tmp.name, "pins.json")
+        self.runner = FakeRunner()
+        self.settings = FakeSettings()
+        self.m = manager.Manager(
+            bus=None,
+            status_file=os.path.join(self.tmp.name, "status.json"),
+            runner=self.runner,
+            pins_file=self.pins_file,
+        )
+        self.m.settings = self.settings
+        self.settings.set_device_setting(IP22, "Key", KEY.hex())
+        self.nonce = 0
+
+    def advert(self):
+        self.nonce += 1
+        self.m.on_advertisement(
+            IP22,
+            -60,
+            adv(
+                IP22,
+                0xA330,
+                records.AC_CHARGER,
+                self.nonce,
+                advgen.ac_charger(state=5, outputs=[(13.5, 5.0)]),
+            ),
+        )
+
+    def enable(self):
+        pins.save(self.pins_file, {IP22: "123456"})
+        self.m.reload_config()
+
+    def published(self):
+        """Charger heard, first read done (night mode off): the switch is there."""
+        self.enable()
+        self.advert()
+        self.clock.now += ctl.FIRST_READ_DELAY
+        self.m.tick()
+        self.assertEqual(self.runner.finish(OFF), "read")
+        self.assertEqual(len(FakeSwitch.created), 1)
+        return FakeSwitch.created[0]
+
+    def test_nothing_without_pin(self):
+        self.m.reload_config()
+        self.advert()
+        self.clock.now += 60
+        self.m.tick()
+        self.assertEqual((self.runner.jobs, FakeSwitch.created), ([], []))
+        self.assertNotIn("control", self.m.status()["devices"][0])
+
+    def test_switch_published_after_first_read(self):
+        self.enable()
+        self.advert()
+        self.assertEqual(self.runner.jobs, [])
+        self.assertEqual(FakeSwitch.created, [], "no switch before the state is known")
+        sw = self.published()
+        self.assertEqual(sw.name, "com.victronenergy.switch.victron_c0ffee000003")
+        self.assertEqual((sw.state, sw.status), (False, ctl.STATUS_OFF))
+        self.assertEqual(sw.product_name, "Blue Smart IP22 Charger 12/30 (1)")
+        self.assertEqual(self.settings.instances[IP22 + "_switch"], ("switch", 20))
+        self.advert()
+        self.assertEqual(len(FakeSwitch.created), 1)
+
+    def test_switch_written(self):
+        sw = self.published()
+        self.assertTrue(sw.on_state(1))
+        self.assertEqual(self.runner.jobs[0][1], "night-on")
+        self.runner.finish(ON)
+        self.assertEqual((sw.state, sw.status), (True, ctl.STATUS_ON))
+        self.assertTrue(sw.on_state(0))
+        self.assertEqual(self.runner.finish(OFF), "night-off")
+        self.assertEqual((sw.state, sw.status), (False, ctl.STATUS_OFF))
+        for bad in (2, -1, "x", None):
+            self.assertFalse(sw.on_state(bad), bad)
+        self.assertEqual(self.runner.jobs, [])
+
+    def test_failed_switch_shows_fault(self):
+        sw = self.published()
+        sw.on_state(1)
+        self.runner.finish({"ok": False, "error": "charger not reachable"})
+        self.assertEqual((sw.state, sw.status), (False, ctl.STATUS_FAULT))
+        status = self.m.status()["devices"][0]["control"]
+        self.assertEqual(status["error"], "charger not reachable")
+        self.assertEqual(status["switch"], sw.name)
+
+    def keep_heard(self, seconds):
+        for _ in range(int(seconds // 100)):
+            self.clock.now += 100
+            self.advert()
+            self.m.tick()
+
+    def test_poll(self):
+        sw = self.published()
+        self.keep_heard(ctl.POLL_INTERVAL - 100)
+        self.assertEqual(self.runner.jobs, [])
+        self.keep_heard(100)
+        self.runner.finish(ON)  # switched on with VictronConnect meanwhile
+        self.assertEqual((sw.state, sw.status), (True, ctl.STATUS_ON))
+
+    def test_removed_with_the_charger(self):
+        sw = self.published()
+        self.keep_heard(ctl.POLL_INTERVAL)
+        self.assertEqual(self.runner.jobs[0][1], "read")  # a read is running
+        self.clock.now += 301
+        self.m.tick()
+        self.assertTrue(sw.closed)
+        self.assertEqual(self.m.controls, {})
+        self.runner.finish(ON)  # the late result changes nothing
+        self.assertEqual(len(FakeSwitch.created), 1)
+
+    def test_pin_removed(self):
+        sw = self.published()
+        os.remove(self.pins_file)
+        self.m.tick()
+        self.assertTrue(sw.closed)
+        self.assertEqual(self.m.controls, {})
+
+    def test_unsupported_charger(self):
+        self.enable()
+        self.advert()
+        self.clock.now += ctl.FIRST_READ_DELAY
+        self.m.tick()
+        self.runner.finish({"ok": False, "unsupported": True, "error": "no night mode register"})
+        self.assertEqual(FakeSwitch.created, [])
+        self.assertTrue(self.m.status()["devices"][0]["control"]["unsupported"])
+
+    def test_output_settings_and_name(self):
+        sw = self.published()
+        self.assertTrue(sw.on_output_setting(ctl.OUTPUT_PATH + "/Settings/CustomName", "Yötila"))
+        self.assertTrue(sw.on_output_setting(ctl.OUTPUT_PATH + "/Settings/ShowUIControl", "0"))
+        self.assertEqual(self.settings.devices[IP22]["NightModeCustomName"], "Yötila")
+        self.assertEqual(self.settings.devices[IP22]["NightModeShowUI"], 0)
+        self.assertTrue(sw.on_custom_name("Shore charger"))
+        self.assertEqual(FakeService.created[0].custom_name, "Shore charger")
+        self.assertEqual(self.settings.devices[IP22]["CustomName"], "Shore charger")
+        # a new switch service (after the charger was away) gets the stored settings
+        self.clock.now += 301
+        self.m.tick()
+        self.m.reload_config()
+        self.advert()
+        self.clock.now += ctl.FIRST_READ_DELAY
+        self.m.tick()
+        self.runner.finish(OFF)
+        sw2 = FakeSwitch.created[-1]
+        self.assertEqual(sw2.output_settings[ctl.OUTPUT_PATH + "/Settings/CustomName"], "Yötila")
+        self.assertEqual(sw2.output_settings[ctl.OUTPUT_PATH + "/Settings/ShowUIControl"], 0)
+        self.assertEqual(sw2.custom_name, "Shore charger")
+
+    def test_shutdown(self):
+        sw = self.published()
+        self.m.shutdown()
+        self.assertTrue(sw.closed and self.runner.stopped)
 
 
 class YieldCounterTest(unittest.TestCase):

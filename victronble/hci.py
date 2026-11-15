@@ -11,6 +11,10 @@ Only if no advertisement at all arrives for a long time (for example because
 "Bluetooth sensors" are disabled and nobody scans) it asks the controller to
 scan with an LE Set Scan Enable command.
 
+The night mode control (vesmart.py) also sends scan commands, only around its
+short GATT connections: the kernel changes the scan while it connects, and
+command() / restore_ble_sensors_scan() put dbus-ble-sensors' scan back.
+
 Python on Venus OS is built without AF_BLUETOOTH support in the socket module,
 so the socket is created through libc with ctypes.
 """
@@ -19,6 +23,7 @@ import ctypes
 import errno
 import logging
 import os
+import select
 import struct
 import time
 
@@ -151,6 +156,106 @@ def list_controllers():
         if name.startswith("hci") and name[3:].isdigit():
             ids.append(int(name[3:]))
     return sorted(ids)
+
+
+# ---- HCI commands (used around GATT connections, see vesmart.py) ----------
+
+EVT_CMD_COMPLETE = 0x0E
+EVT_CMD_STATUS = 0x0F
+OGF_LE = 0x08
+OCF_LE_SET_SCAN_PARAMETERS = 0x000B
+OCF_LE_SET_SCAN_ENABLE = 0x000C
+
+# The scan set up by dbus-ble-sensors (src/ble-scan.c, ble_scan_setup()):
+# passive, window 15 (9.375 ms), interval = window with ContinuousScan,
+# else 90; own address random, public if the controller refuses that.
+BLE_SENSORS_SCAN_WINDOW = 15
+BLE_SENSORS_SCAN_INTERVAL = 90
+LE_PUBLIC_ADDRESS = 0
+LE_RANDOM_ADDRESS = 1
+
+
+def command_packet(ogf, ocf, params=b""):
+    return struct.pack("<BHB", HCI_COMMAND_PKT, (ogf << 10) | ocf, len(params)) + bytes(params)
+
+
+def command_status(pkt, opcode):
+    """Status byte of a Command Complete / Command Status event for opcode, else None."""
+    if len(pkt) < 7 or pkt[0] != HCI_EVENT_PKT:
+        return None
+    if pkt[1] == EVT_CMD_COMPLETE and struct.unpack_from("<H", pkt, 4)[0] == opcode:
+        return pkt[6]
+    if pkt[1] == EVT_CMD_STATUS and struct.unpack_from("<H", pkt, 5)[0] == opcode:
+        return pkt[3]
+    return None
+
+
+def command(dev_id, ogf, ocf, params=b"", timeout=1.0):
+    """Send an HCI command to hciN; returns the status byte of the reply
+    (0 = success) or None when none arrived in time. Needs root."""
+    opcode = (ogf << 10) | ocf
+    fd = _libc.socket(AF_BLUETOOTH, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, BTPROTO_HCI)
+    if fd < 0:
+        raise _oserror("socket")
+    try:
+        addr = struct.pack("<HHH", AF_BLUETOOTH, dev_id, HCI_CHANNEL_RAW)
+        if _libc.bind(fd, addr, len(addr)) < 0:
+            raise _oserror("bind hci%d" % dev_id)
+        events = (1 << EVT_CMD_COMPLETE) | (1 << EVT_CMD_STATUS)
+        flt = struct.pack("<IIIH2x", 1 << HCI_EVENT_PKT, events, 0, opcode)
+        if _libc.setsockopt(fd, SOL_HCI, HCI_FILTER, flt, len(flt)) < 0:
+            raise _oserror("setsockopt HCI_FILTER")
+        os.write(fd, command_packet(ogf, ocf, params))
+        deadline = time.monotonic() + timeout
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            ready, _, _ = select.select([fd], [], [], left)
+            if not ready:
+                continue
+            try:
+                pkt = os.read(fd, 260)
+            except BlockingIOError:
+                continue
+            status = command_status(pkt, opcode)
+            if status is not None:
+                return status
+    finally:
+        os.close(fd)
+
+
+def le_set_scan_enable(dev_id, enable, filter_duplicates):
+    return command(
+        dev_id, OGF_LE, OCF_LE_SET_SCAN_ENABLE, bytes([int(bool(enable)), int(bool(filter_duplicates))])
+    )
+
+
+def le_set_scan_parameters(dev_id, active, interval, window, own_address_type, filter_policy=0):
+    params = struct.pack("<BHHBB", int(bool(active)), interval, window, own_address_type, filter_policy)
+    return command(dev_id, OGF_LE, OCF_LE_SET_SCAN_PARAMETERS, params)
+
+
+def reset_duplicate_filter(dev_id):
+    """Scan off and on again without duplicate filtering; the scan parameters
+    stay as they are. Returns the status of the enable command."""
+    le_set_scan_enable(dev_id, False, False)
+    return le_set_scan_enable(dev_id, True, False)
+
+
+def restore_ble_sensors_scan(dev_id, continuous):
+    """Set up the scan exactly as dbus-ble-sensors does when it starts.
+    Returns (parameters status, enable status)."""
+    interval = BLE_SENSORS_SCAN_WINDOW if continuous else BLE_SENSORS_SCAN_INTERVAL
+    params_status = None
+    for own_address_type in (LE_RANDOM_ADDRESS, LE_PUBLIC_ADDRESS):
+        le_set_scan_enable(dev_id, False, True)
+        params_status = le_set_scan_parameters(
+            dev_id, False, interval, BLE_SENSORS_SCAN_WINDOW, own_address_type
+        )
+        if params_status == 0:
+            break
+    return params_status, le_set_scan_enable(dev_id, True, False)
 
 
 class Listener:

@@ -9,11 +9,16 @@ Node-RED), without a cable and without pairing. The data is read only.
 The advertisements are encrypted; a device is published once its key is set:
     victron-ble key <MAC> <KEY>     (key from VictronConnect: Product info >
                                      Instant readout via Bluetooth > Show)
+
+Optionally the night mode of a Blue Smart charger can be switched (a switch in
+the gui-v2 switch pane); that needs the charger's Bluetooth PIN:
+    victron-ble control <MAC> on
 """
 
 import argparse
 import logging
 import os
+import shlex
 import signal
 import sys
 import time
@@ -26,7 +31,7 @@ import dbus  # noqa: E402
 import dbus.mainloop.glib  # noqa: E402
 from gi.repository import GLib  # noqa: E402
 
-from victronble import VERSION, aes  # noqa: E402
+from victronble import VERSION, aes, control  # noqa: E402
 from victronble import settings as st  # noqa: E402
 from victronble.hci import Listener  # noqa: E402
 from victronble.manager import Manager  # noqa: E402
@@ -108,6 +113,20 @@ def main():
         default=120,
         help="enable scanning when nothing was received for this many seconds (0 = never, default 120)",
     )
+    parser.add_argument(
+        "--pins-file",
+        default=os.path.join(HERE, "pins.json"),
+        help="Bluetooth PINs of controlled chargers (default: pins.json next to this script)",
+    )
+    parser.add_argument(
+        "--control-poll",
+        type=int,
+        default=control.POLL_INTERVAL,
+        help="read the night mode of controlled chargers this often, seconds (default %d)"
+        % control.POLL_INTERVAL,
+    )
+    parser.add_argument("--no-control", action="store_true", help="never connect to a device (no night mode)")
+    parser.add_argument("--control-helper", help=argparse.SUPPRESS)  # tests: replaces the vesmart helper
     parser.add_argument("--replay", metavar="FILE", help="feed advertisements from FILE (testing)")
     parser.add_argument("--replay-loop", action="store_true", help="repeat the replay file forever")
     parser.add_argument("--dcsource-name-delay", type=float, default=10, help=argparse.SUPPRESS)  # tests
@@ -124,12 +143,24 @@ def main():
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = connect_bus()
 
+    runner = None
+    if not args.no_control:
+        helper = (
+            shlex.split(args.control_helper)
+            if args.control_helper
+            else [sys.executable, "-u", "-m", "victronble.vesmart"]
+        )
+        runner = control.HelperRunner(GLib, helper, args.pins_file, cwd=HERE)
+
     manager = Manager(
         bus,
         timeout=args.timeout,
         state_file=args.state_file,
         status_file=args.status_file,
         mirror_name_delay=args.dcsource_name_delay,
+        runner=runner,
+        pins_file=args.pins_file,
+        control_poll=args.control_poll,
     )
 
     def load_config():

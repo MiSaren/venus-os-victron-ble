@@ -17,8 +17,9 @@ as regular Venus OS devices:
 
 The devices then show up like wired ones: in the GUI (device list, overview,
 battery and charger pages), on VRM (logging, dashboard, remote console), over
-MQTT and in Node-RED. The data is **read only**: nothing can be set or
-switched, and the devices take no part in DVCC.
+MQTT and in Node-RED. The data is **read only**, and the devices take no part
+in DVCC. One optional exception: the **night mode of a Blue Smart charger** can
+be switched from Venus OS, see [Night mode switch](#night-mode-switch-blue-smart-chargers).
 
 ![gui-v2 overview with a Bluetooth SmartShunt, SmartSolar and IP22 charger](docs/img/brief.png)
 
@@ -26,7 +27,7 @@ switched, and the devices take no part in DVCC.
 SmartSolar, battery from the SmartShunt, and DC loads computed with the IP22
 charger's output.*
 
-**Status:** version 0.1.0, tested in one installation: a Raspberry Pi 4 with
+**Status:** version 0.2.0, tested in one installation: a Raspberry Pi 4 with
 Venus OS v3.85 (large), a SmartShunt, a SmartSolar MPPT and a Blue Smart IP22
 charger. Technical background: [docs/design.md](docs/design.md).
 
@@ -40,7 +41,8 @@ charger. Technical background: [docs/design.md](docs/design.md).
   has been received for two minutes, for example because Bluetooth sensors
   are disabled, it switches scanning on.
 - **No pairing, no connection.** Advertisements are broadcast; the devices stay
-  free for VictronConnect on phones.
+  free for VictronConnect on phones. (The optional night mode switch is the
+  exception: it connects briefly and needs the charger's PIN.)
 - The records are decrypted with each device's key (AES-128-CTR) and decoded
   according to Victron's
   [Extra manufacturer data](https://communityarchive.victronenergy.com/storage/attachments/extra-manufacturer-data-2022-12-14.pdf)
@@ -65,14 +67,14 @@ GX devices with Bluetooth. Root access via SSH is needed to install it.
 
 ## Install
 
-Download `venus-os-victron-ble-0.1.0.tar.gz` from the
+Download `venus-os-victron-ble-0.2.0.tar.gz` from the
 [latest release](https://github.com/MiSaren/venus-os-victron-ble/releases/latest),
 copy it to the Venus device and run the installer:
 
 ```sh
-scp venus-os-victron-ble-0.1.0.tar.gz root@venus.local:/tmp/
+scp venus-os-victron-ble-0.2.0.tar.gz root@venus.local:/tmp/
 ssh root@venus.local
-cd /tmp && tar -xzf venus-os-victron-ble-0.1.0.tar.gz && victron-ble/install.sh
+cd /tmp && tar -xzf venus-os-victron-ble-0.2.0.tar.gz && victron-ble/install.sh
 ```
 
 The installer copies everything to `/data/victron-ble`, adds the boot hook
@@ -103,7 +105,7 @@ To build the package yourself from a clone of this repository, run
 `victron-ble` without arguments shows what the service hears and publishes:
 
 ```
-dbus-victron-ble 0.1.0, up 5 s, Bluetooth: hci0, advertisements: 95 (Victron 95)
+dbus-victron-ble 0.2.0, up 5 s, Bluetooth: hci0, advertisements: 95 (Victron 95)
 
 ADDRESS            PRODUCT                            TYPE              RSSI  HEARD  KEY  STATE
 C0:FF:EE:00:00:01  SmartShunt 500A/50mV               battery monitor    -60     0s  yes  ok
@@ -137,6 +139,7 @@ voltage sense.
 | solarcharger | `/State`, `/ErrorCode`, `/Dc/0/Voltage`, `/Dc/0/Current`, `/Yield/Power`, `/History/Daily/0/Yield`, `/Load/I`, `/Yield/User` |
 | charger | `/State`, `/ErrorCode`, `/Dc/0..2/Voltage`, `/Dc/0..2/Current`, `/NrOfOutputs`, `/Dc/0/Temperature`, `/Ac/In/L1/I` |
 | dcsource (optional, for AC chargers) | `/Settings/MonitorMode` = -2 (AC charger), `/Dc/0/Voltage`, `/Dc/0/Current` and `/Dc/0/Power` (all outputs together), `/Dc/0/Temperature` |
+| switch (optional, chargers with a PIN) | `/State` = 256 (connected), `/SwitchableOutput/night/State` (writable: 1 night mode, 0 normal), `/SwitchableOutput/night/Status` (0 off, 9 on, 8 fault), `/SwitchableOutput/night/Name` = *Night mode*, `/SwitchableOutput/night/Settings/{CustomName,Group,ShowUIControl}` (writable, kept in the settings), `/SwitchableOutput/night/Settings/Type` = 1 (toggle) |
 
 A SmartShunt becomes the system battery monitor when it is the only one
 (Settings > System setup > Battery monitor: Automatic).
@@ -179,6 +182,58 @@ for a wired IP22.
 Not in the advertisements, so not available: PV voltage, history beyond
 today, firmware version, serial number, relay state and settings.
 
+## Night mode switch (Blue Smart chargers)
+
+Optionally, `dbus-victron-ble` switches the **night mode** of a Blue Smart
+charger, as VictronConnect does: the charger then limits its current to 50 %
+and stops its fan for 8 hours, or until night mode is switched off. Unlike
+everything else here, this needs a Bluetooth connection, and so the charger's
+Bluetooth PIN:
+
+```sh
+/data/victron-ble/victron-ble control C0:FF:EE:12:34:56 on    # asks for the PIN
+```
+
+The PIN can also come from stdin (`echo 123456 | victron-ble control ...`), but
+never from the command line. Within a minute the service reads the charger,
+and a **Night mode** switch appears in the gui-v2 switch pane, under the
+charger's name. It is a regular Venus OS switch,
+`com.victronenergy.switch.victron_<mac>`, so Node-RED and other D-Bus or MQTT
+clients can use it too: `/SwitchableOutput/night/State`, 1 = night mode,
+0 = normal. From the command line: `victron-ble night <MAC> on|off`, or without
+a state to show it.
+
+- **What it writes:** one register of the charger, 0xE001 (charge current
+  mode), 0 = normal and 2 = night. The charger lowers its maximum current
+  itself. The code refuses to send any other write.
+- **Where the register comes from:** Victron does not document this protocol.
+  The register was found by reading all registers of a Blue Smart IP22 12/30
+  (firmware 3.69) with night mode off, on and off again, then confirmed by
+  writing it and checking the result in VictronConnect. Other Blue Smart
+  models probably use the same register. If a charger does not have it, no
+  switch is published, and the log says so.
+- **Short connections:** a session takes 5 to 10 seconds: when the switch is
+  used, and every 15 minutes to read the state. Night mode also changes with
+  VictronConnect or the MODE button, and it ends by itself after 8 hours.
+  During a session VictronConnect cannot connect to the charger. The other way
+  round, while VictronConnect is connected, a switch attempt fails. The switch
+  then shows a fault until the next successful read.
+- **Pairing:** the charger only talks to paired devices. The service pairs by
+  itself with the stored PIN, also after every reboot, because Venus OS does
+  not keep Bluetooth pairings. The PIN is in `/data/victron-ble/pins.json`,
+  readable by root only. It is not stored in the Venus settings, because
+  anyone on the LAN can read those through MQTT. After changing the charger's
+  PIN, run `victron-ble control <MAC> on` again.
+- **Instant readout keeps working:** while connecting, the kernel changes the
+  Bluetooth scan, and the service then restores `dbus-ble-sensors`' scan
+  settings ([docs/design.md](docs/design.md)).
+- **No on/off:** the IP22 has no register for switching the charger off, and
+  VictronConnect has no such switch for it either.
+- `victron-ble control <MAC> off` removes the PIN and the pairing, and the
+  switch disappears.
+- `--control-poll SECONDS` changes the read interval, and `--no-control`
+  turns the feature off completely (options of `dbus-victron-ble.py`).
+
 ## Range and update rate
 
 - By default `dbus-ble-sensors` scans about one sixth of the time, which is
@@ -205,7 +260,10 @@ today, firmware version, serial number, relay state and settings.
 
 - `/data/victron-ble/victron-ble` shows the state of each device:
   *no key*, *wrong key*, *ok*, *no data* (gone for 5 minutes),
-  *not supported* (another record type).
+  *not supported* (another record type). For a charger with night mode
+  control, a *night mode:* line shows the state, the time of the last read,
+  and the last error, such as *pairing failed: wrong PIN?* or *charger not
+  reachable (busy with VictronConnect, or out of range?)*.
 - Log: `tail -F /var/log/dbus-victron-ble/current | tai64nlocal`
 - Service: `svstat /service/dbus-victron-ble`, restart with `svc -t /service/dbus-victron-ble`
 - Do not store a key for a device that is also connected by cable
@@ -228,8 +286,12 @@ The keys, names and VRM instances remain in the Venus OS settings.
 dbus-victron-ble.py     the service
 victron-ble             command line tool
 victronble/records.py   record decoders (bit layouts of the specification)
-victronble/hci.py       passive HCI listener
+victronble/hci.py       passive HCI listener, scan commands
 victronble/manager.py   devices, keys, D-Bus services
+victronble/control.py   night mode switch: helper sessions, switch service
+victronble/vesmart.py   VE.Smart (GATT) protocol, the Bluetooth session helper
+victronble/cbor.py      minimal CBOR for VE.Smart
+victronble/pins.py      the root-only PIN file
 victronble/settings.py  localsettings access
 victronble/products.py  product names (generated by tools/gen_products.py)
 ext/velib_python/       Victron's vedbus.py (MIT)
@@ -242,8 +304,9 @@ docs/design.md          design notes
   of a SmartShunt, a BlueSolar MPPT and a Blue Smart IP22 with their keys.
 - `tests/integration_test.py` runs the service on a private D-Bus with
   synthetic, encrypted advertisements (`--replay`) and checks the published
-  services, names, instances, keys added at runtime, the yield counter and
-  the timeout. By default it uses a small localsettings stand-in, which makes
+  services, names, instances, keys added at runtime, the yield counter,
+  the timeout and the night mode switch (with `tests/fake_vesmart.py`
+  standing in for the Bluetooth session). By default it uses a small localsettings stand-in, which makes
   it safe on a live Venus device. With `--localsettings path/to/localsettings.py`
   it uses the real localsettings, but only do that on a development machine:
   a second localsettings instance on a Venus device checks the password file
@@ -260,7 +323,9 @@ docs/design.md          design notes
 - **... use a BlueZ/bleak based driver?** Those start their own scans through
   BlueZ, which interferes with the raw HCI scanning of `dbus-ble-sensors`
   (RuuviTags and tank sensors stop updating). Libraries installed with pip
-  also vanish with every firmware update.
+  also vanish with every firmware update. The night mode switch does use
+  BlueZ (through D-Bus, no extra packages), but only for short connections
+  without scanning, and it restores the scan afterwards.
 
 ## Credits and license
 
@@ -269,6 +334,9 @@ docs/design.md          design notes
 - [keshavdv/victron-ble](https://github.com/keshavdv/victron-ble) (public
   domain): real advertisements with keys used as test vectors, and the
   product name table.
+- VE.Smart protocol: the server side in Venus OS' own `vesmart-server`, and
+  community notes by [kkrankall/victron-ble-gatt](https://github.com/kkrankall/victron-ble-gatt)
+  and [Prinsessen/victron-ble-openhab](https://github.com/Prinsessen/victron-ble-openhab).
 
 MIT license, see [LICENSE](LICENSE).
 

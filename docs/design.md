@@ -4,6 +4,8 @@
 
 - Monitor Victron Bluetooth devices on Venus OS through their *Instant
   Readout* advertisements, read only.
+- One opt-in exception: switch the night mode of Blue Smart chargers over a
+  short GATT connection (see *Night mode control* below).
 - Publish them as native Venus OS services, so that the GUI, VRM, MQTT and
   Node-RED work with them as with wired devices.
 - Never disturb Venus OS' own `dbus-ble-sensors` (RuuviTags, tank sensors,
@@ -207,7 +209,119 @@ re-enables it every 10 s. By default the interval is 90 and the window is 15
 (× 0.625 ms), so about one sixth of the time is spent listening. With
 *Continuous scanning* both are 15, so it listens all the time.
 `dbus-victron-ble` only enables scanning itself (LE Set Scan Enable) when
-nothing at all has been received for 120 seconds.
+nothing at all has been received for 120 seconds. The night mode control is
+the other exception: around its connections it resets the duplicate filter
+and restores this scan (next section).
+
+## Night mode control
+
+Opt-in per charger: a charger with a PIN in `pins.json` (root only) gets a
+`ChargerControl` and, once its state has been read, a
+`com.victronenergy.switch.victron_<mac>` service with one toggle output.
+
+```
+Manager ─ ChargerControl ─ HelperRunner ─ python3 -m victronble.vesmart (one session per process)
+   │        state, polling,   one session        BlueZ D-Bus: connect, pair, GATT, VE.Smart
+   │        requests          at a time,         raw HCI: duplicate filter reset, scan restore
+   └ SwitchService            90 s timeout       prints one JSON line
+     /SwitchableOutput/night/...
+```
+
+The Bluetooth session runs in a helper process. It waits synchronously and
+iterates its own GLib main loop. A stuck session can then not block the
+listener and the services, and the runner kills it after 90 s.
+
+**VE.Smart protocol.** This is VictronConnect's protocol. Venus OS contains
+its server side in `/opt/victronenergy/vesmart-server`, for VictronConnect
+connecting to the GX itself. It uses GATT service
+306b0001-b081-4037-83dc-e59fcc3cdfd0 with three characteristics:
+
+- 306b0002 is the control characteristic. A read returns flags, the maximum
+  number of instances, free chunks, chunk size and ATT length. Written or
+  notified flow control messages are F9 *n* (*n* more chunks may be sent),
+  FA (chunk info), F8 (abort) and F7 (error).
+- 306b0003 carries the last piece of a chunk.
+- 306b0004 carries the other pieces.
+
+A chunk is a CBOR sequence of messages:
+
+| Message | Meaning | Answer |
+|---|---|---|
+| `1` | device list | `2 [instance, type, ...]` |
+| `3 inst` | subscribe | `7 inst 3 result` |
+| `5 inst [vregs]` | get | `8 inst vreg bytes` or `9 inst vreg error` |
+| `6 inst [vreg, bytes]` | set | `8 ...` (echo) |
+
+Values are VE.Direct registers as little endian bytes.
+
+The Blue Smart IP22 12/30 (firmware 3.69) reported:
+
+- its services: 1801, 306b0001-…cdfd0, 306b0001-…cdfd1 and 97580001
+- ATT MTU 23; the control read returned `00 0100 01 50 1400` (one instance,
+  one free chunk, chunks of 80 bytes, ATT length 20)
+- the device list `[0, 0]`
+
+The charger gives one chunk of credit at a time. About 250 registers per
+second can be read, 20 per request.
+
+**Finding the register.** All registers 0000-0FFF, 2000-2FFF and E000-EFFF
+were read with night mode off, on (switched in VictronConnect) and off again;
+122 exist. Apart from live values (voltages, currents, timers, the VE.Smart
+network table) only two changed: 0xE001 0 → 2 → 0 and 0xEDF0 (maximum
+current) 30.0 → 15.0 → 30.0 A. Writing 0xE001 alone switches night mode, and
+the charger adjusts 0xEDF0 itself, as it must do when night mode ends after
+8 h. 0x0200 (device mode, the on/off of MPPTs) does not exist on the IP22.
+Only two SET frames can leave `vesmart.py`: `06 00 82 19 e001 41 02` and
+`… 41 00`. `check_frame()` refuses any other.
+
+**Venus OS specifics**, each found on the device:
+
+- *Duplicate filter.* Kernel 5.10 connects through a background scan with
+  the accept list and duplicate filtering on. The Raspberry Pi controller
+  filters duplicates per address, and the charger alternates instant
+  readout advertisements (ADV_NONCONN_IND) with connectable ones (ADV_IND).
+  After the first non-connectable report the kernel saw no ADV_IND, so it
+  never sent LE Create Connection. While connecting, the session restarts
+  the scan without duplicate filtering, through a raw HCI socket.
+- *Scan left behind.* After connecting, the kernel leaves its own scan
+  parameters in the controller (accept list = the charger, 60 ms window).
+  `dbus-ble-sensors` only re-enables scanning every 10 s, which left every
+  other device silent. The session puts `dbus-ble-sensors`' parameters back
+  (`hci.restore_ble_sensors_scan()`, the same commands as its
+  `ble_scan_setup()`) right after connecting and again after disconnecting.
+  It skips this when Bluetooth sensors are disabled.
+- *No GATT client for ConnectDevice.* `/etc/bluetooth/ble.conf` sets
+  `ReverseServiceDiscovery = false`. bluetoothd then starts its GATT client
+  only for a connection requested with Device1.Connect(), not for
+  Adapter1.ConnectDevice(). ConnectDevice is used only to create the device
+  object when bluetoothd does not know the charger. That link is dropped at
+  once.
+- *Pairing order.* Device1.Connect() returns as soon as ATT is up. A Pair()
+  that completes while the first GATT discovery still runs is never answered
+  by bluetoothd 5.72: the browse for the pairing request fails with EBUSY
+  and the request is dropped. The session therefore waits for
+  ServicesResolved, then pairs.
+- *Agent.* `vesmart-server` owns the default agent (DisplayOnly). Pairing
+  uses an agent of the helper with KeyboardOnly capability, so the kernel
+  asks for the passkey and the agent enters the PIN. The charger answers as
+  DisplayOnly with legacy pairing. `forced_passkey`, Victron's kernel patch
+  for the GX's own PIN, only applies when the GX displays the passkey.
+- *Failed pairings count.* `vesmart-server` counts every authentication
+  failure, including ours, and blocks pairing with the GX for a while after
+  10 of them. Writes are therefore never retried blindly.
+- *Pairings do not survive a reboot.* `/var/lib/bluetooth` is on tmpfs, so
+  the first session after a reboot pairs again. The charger accepts this,
+  tested by removing the pairing on the GX.
+
+**Polling and state.** After the first read (5 s after the charger is
+published) the control reads every 15 minutes; failures retry after 60 s,
+doubling up to 15 minutes. A switch request is sent right away, or right
+after the session that is running. The switch shows the requested state
+while it is pending. A failed switch is not retried: the old state comes
+back with Status 8 (fault) until the next successful read. A charger
+without the register (value error 1) disables the control and gets no
+switch. gui-v2 lists an output only once its `/State` is valid, so the
+service is published after the first successful read.
 
 ## Boot and persistence
 
@@ -236,7 +350,12 @@ instead of waking up for every event would cut most of that.
 - `tests/test_hci.py`, `tests/test_listener.py`: HCI event parsing, malformed
   packets, listener behaviour with a socket pair, scan watchdog.
 - `tests/test_manager.py`: keys, wrong keys, timeouts, returns, renames, VRM
-  instances, record type changes, the yield counter and its persistence.
+  instances, record type changes, the yield counter and its persistence,
+  and the night mode switch lifecycle with a fake runner.
+- `tests/test_vesmart.py`, `tests/test_control.py`, `tests/test_pins.py`:
+  CBOR, VE.Smart frames and messages (bytes seen on the IP22), the SET guard,
+  the control state machine, the helper runner with a fake helper process,
+  and the PIN file.
 - `tests/integration_test.py`: the real service on a private D-Bus, fed with
   synthetic encrypted advertisements, checked over D-Bus and with the
   command line tool. It runs against a localsettings stand-in or, on a
@@ -246,7 +365,9 @@ instead of waking up for every event would cut most of that.
 
 ## Limitations and ideas
 
-- Read only: no switching, no settings, no DVCC participation, no relay.
+- Read only, apart from the night mode switch: no other settings, no DVCC
+  participation, no relay. Low current mode is probably 0xE001 = 1, which is
+  not verified.
 - The gui-v2 key field belongs to `dbus-ble-sensors`' device list, so keys
   are entered with `victron-ble key` (or written to the setting, for example
   over MQTT).

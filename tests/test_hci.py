@@ -63,5 +63,30 @@ class AdvertisingDataTest(unittest.TestCase):
         self.assertEqual(hci.format_address(bytes([0x56, 0x34, 0x12, 0xEE, 0xFF, 0xC0])), ADDRESS)
 
 
+class CommandTest(unittest.TestCase):
+    """The scan commands sent around GATT connections (as dbus-ble-sensors sends them)."""
+
+    def test_packets(self):
+        self.assertEqual(
+            hci.command_packet(hci.OGF_LE, hci.OCF_LE_SET_SCAN_ENABLE, b"\x01\x00").hex(), "010c20020100"
+        )
+        self.assertEqual(
+            hci.command_packet(hci.OGF_LE, hci.OCF_LE_SET_SCAN_ENABLE, b"\x01\x00"), hci.LE_SET_SCAN_ENABLE
+        )
+        params = bytes([0, 15, 0, 15, 0, hci.LE_RANDOM_ADDRESS, 0])  # passive, 9.375 ms / 9.375 ms
+        self.assertEqual(
+            hci.command_packet(hci.OGF_LE, hci.OCF_LE_SET_SCAN_PARAMETERS, params).hex(),
+            "010b2007000f000f000100",
+        )
+
+    def test_status(self):
+        complete = bytes.fromhex("040e04010c2000")  # Command Complete, LE Set Scan Enable, success
+        self.assertEqual(hci.command_status(complete, 0x200C), 0)
+        self.assertIsNone(hci.command_status(complete, 0x200B))
+        self.assertEqual(hci.command_status(bytes.fromhex("040e04010c200c"), 0x200C), 0x0C)  # disallowed
+        self.assertEqual(hci.command_status(bytes.fromhex("040f0412010b20"), 0x200B), 0x12)  # Command Status
+        self.assertIsNone(hci.command_status(bytes.fromhex("043e0c02"), 0x200C))  # LE meta event
+
+
 if __name__ == "__main__":
     unittest.main()
