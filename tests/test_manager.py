@@ -294,13 +294,109 @@ class ManagerTest(unittest.TestCase):
         self.m.shutdown()
         with open(self.state_file) as f:
             saved = json.load(f)["victron_c0ffee000002"]
-        self.assertEqual(saved, {"yield_total": 1.05, "yield_last_daily": 0.35})
+        self.assertEqual(saved["yield_total"], 1.05)
+        self.assertEqual(saved["yield_last_daily"], 0.35)
         # restart: continues where it was, including the yield made meanwhile
         FakeService.created = []
         m2 = self.make_manager()
         m2.reload_config()
         m2.on_advertisement(MPPT, -60, self.mppt(nonce + 1, 0.55))
         self.assertEqual(FakeService.created[0].values["/Yield/User"], 1.25)
+
+    def solar_history_setup(self):
+        self.date = "2026-11-15"
+        p = mock.patch.object(manager.hist, "local_date", lambda wall=None: self.date)
+        p.start()
+        self.addCleanup(p.stop)
+        self.settings.set_device_setting(MPPT, "Key", KEY.hex())
+        self.m.reload_config()
+
+    def test_solar_history_published(self):
+        self.solar_history_setup()
+        self.m.on_advertisement(MPPT, -60, self.mppt(1, 0.40, pv=80))
+        svc = FakeService.created[0]
+        self.assertIn("/History/Daily/30/Yield", svc.paths)
+        v = svc.values
+        self.assertEqual(v["/History/Overall/DaysAvailable"], 1)
+        # first start in bulk: today's yield so far is what the charger counted
+        self.assertEqual(v["/History/Daily/0/Yield"], 0.40)
+        self.assertEqual(v["/History/Daily/0/MaxPower"], 80)
+        self.assertEqual(v["/History/Daily/0/MinBatteryVoltage"], 13.4)
+        self.assertEqual(v["/History/Daily/0/MaxBatteryCurrent"], 5.0)
+        self.assertIsNone(v["/History/Daily/0/MaxPvVoltage"])
+        self.assertIsNone(v["/History/Daily/1/Yield"])
+        self.m.on_advertisement(MPPT, -60, self.mppt(2, 0.55, pv=120))
+        self.assertEqual(svc.values["/History/Daily/0/Yield"], 0.55)
+        self.assertEqual(svc.values["/History/Daily/0/MaxPower"], 120)
+        self.assertEqual(svc.values["/Yield/User"], 0.15)  # VRM counter: increase only
+
+        # time in bulk, counted while data comes in (the same advertisement again)
+        for _ in range(25):
+            self.clock.now += 5
+            self.m.on_advertisement(MPPT, -60, self.mppt(2, 0.55, pv=120))
+            self.m.tick()
+        self.assertEqual(svc.values["/History/Daily/0/TimeInBulk"], 2)
+        self.clock.now += 120  # no data for a while: not counted
+        self.m.tick()
+        self.assertEqual(svc.values["/History/Daily/0/TimeInBulk"], 2)
+
+        # midnight: yesterday moves to day 1; the charger still shows yesterday's
+        # counter until sunrise, which is not today's yield
+        self.date = "2026-11-16"
+        self.m.on_advertisement(MPPT, -60, self.mppt(3, 0.55, pv=0))
+        v = svc.values
+        self.assertEqual(v["/History/Overall/DaysAvailable"], 2)
+        self.assertEqual(v["/History/Daily/0/Yield"], 0.0)
+        self.assertEqual(v["/History/Daily/1/Yield"], 0.55)
+        self.assertEqual(v["/History/Daily/1/MaxPower"], 120)
+        self.m.on_advertisement(MPPT, -60, self.mppt(4, 0.0, pv=10))  # sunrise: counter reset
+        self.m.on_advertisement(MPPT, -60, self.mppt(5, 0.07, pv=60))
+        self.assertEqual(svc.values["/History/Daily/0/Yield"], 0.07)
+        self.assertEqual(svc.values["/Yield/User"], 0.22)
+
+        # two days without the GX: empty days keep day n = n days ago
+        self.date = "2026-11-19"
+        self.m.on_advertisement(MPPT, -60, self.mppt(6, 0.0, pv=0))
+        v = svc.values
+        self.assertEqual(v["/History/Overall/DaysAvailable"], 5)
+        self.assertIsNone(v["/History/Daily/1/Yield"])
+        self.assertIsNone(v["/History/Daily/2/Yield"])
+        self.assertEqual(v["/History/Daily/3/Yield"], 0.07)
+        self.assertEqual(v["/History/Daily/4/Yield"], 0.55)
+
+        # persisted and restored
+        self.m.shutdown()
+        with open(self.state_file) as f:
+            saved = json.load(f)["victron_c0ffee000002"]["history"]
+        self.assertEqual(
+            [d["date"] for d in saved], ["2026-11-19", "2026-11-18", "2026-11-17", "2026-11-16", "2026-11-15"]
+        )
+        FakeService.created = []
+        m2 = self.make_manager()
+        m2.reload_config()
+        m2.on_advertisement(MPPT, -60, self.mppt(7, 0.02, pv=30))
+        v = FakeService.created[0].values
+        self.assertEqual(v["/History/Overall/DaysAvailable"], 5)
+        self.assertEqual(v["/History/Daily/0/Yield"], 0.02)
+        self.assertEqual(v["/History/Daily/4/Yield"], 0.55)
+        self.assertEqual(v["/History/Daily/4/TimeInBulk"], 2)
+
+    def test_solar_history_first_start_at_night(self):
+        self.solar_history_setup()
+        with mock.patch.object(manager.time, "localtime", lambda *a: mock.Mock(tm_hour=3)):
+            self.m.on_advertisement(
+                MPPT,
+                -60,
+                adv(
+                    MPPT,
+                    0xA053,
+                    records.SOLAR_CHARGER,
+                    1,
+                    advgen.solar_charger(state=0, voltage=12.8, current=0, yield_today_kwh=0.5, pv_w=0),
+                ),
+            )
+        # charger off before sunrise: its counter is still yesterday's
+        self.assertEqual(FakeService.created[0].values["/History/Daily/0/Yield"], 0.0)
 
     def test_state_saved_rarely(self):
         self.settings.set_device_setting(MPPT, "Key", KEY.hex())

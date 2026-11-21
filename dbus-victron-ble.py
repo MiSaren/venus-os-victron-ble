@@ -163,9 +163,22 @@ def main():
         control_poll=args.control_poll,
     )
 
+    def apply_timezone():
+        """Local time = the Venus time zone setting (the system clock runs in UTC);
+        the days of the solar history are calendar days in local time."""
+        try:
+            tz = manager.settings.get("/Settings/System/TimeZone")
+        except dbus.exceptions.DBusException:
+            return
+        if tz and os.environ.get("TZ") != tz and os.path.exists(os.path.join("/usr/share/zoneinfo", tz)):
+            os.environ["TZ"] = tz
+            time.tzset()
+            log.info("time zone %s", tz)
+
     def load_config():
         if not manager.reload_config():
             return True  # localsettings not up yet (boot): try again
+        apply_timezone()
         configured = manager.configured()
         log.info(
             "%d device(s) with a key%s",
@@ -218,6 +231,7 @@ def main():
 
     def every_minute():
         manager.reload_config()
+        apply_timezone()
         manager.check_ble_sensors()
         if listener is not None:
             listener.refresh()

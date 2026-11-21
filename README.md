@@ -27,7 +27,7 @@ be switched from Venus OS, see [Night mode switch](#night-mode-switch-blue-smart
 SmartSolar, battery from the SmartShunt, and DC loads computed with the IP22
 charger's output.*
 
-**Status:** version 0.2.0, tested in one installation: a Raspberry Pi 4 with
+**Status:** version 0.3.0, tested in one installation: a Raspberry Pi 4 with
 Venus OS v3.85 (large), a SmartShunt, a SmartSolar MPPT and a Blue Smart IP22
 charger. Technical background: [docs/design.md](docs/design.md).
 
@@ -67,14 +67,14 @@ GX devices with Bluetooth. Root access via SSH is needed to install it.
 
 ## Install
 
-Download `venus-os-victron-ble-0.2.0.tar.gz` from the
+Download `venus-os-victron-ble-0.3.0.tar.gz` from the
 [latest release](https://github.com/MiSaren/venus-os-victron-ble/releases/latest),
 copy it to the Venus device and run the installer:
 
 ```sh
-scp venus-os-victron-ble-0.2.0.tar.gz root@venus.local:/tmp/
+scp venus-os-victron-ble-0.3.0.tar.gz root@venus.local:/tmp/
 ssh root@venus.local
-cd /tmp && tar -xzf venus-os-victron-ble-0.2.0.tar.gz && victron-ble/install.sh
+cd /tmp && tar -xzf venus-os-victron-ble-0.3.0.tar.gz && victron-ble/install.sh
 ```
 
 The installer copies everything to `/data/victron-ble`, adds the boot hook
@@ -105,7 +105,7 @@ To build the package yourself from a clone of this repository, run
 `victron-ble` without arguments shows what the service hears and publishes:
 
 ```
-dbus-victron-ble 0.2.0, up 5 s, Bluetooth: hci0, advertisements: 95 (Victron 95)
+dbus-victron-ble 0.3.0, up 5 s, Bluetooth: hci0, advertisements: 95 (Victron 95)
 
 ADDRESS            PRODUCT                            TYPE              RSSI  HEARD  KEY  STATE
 C0:FF:EE:00:00:01  SmartShunt 500A/50mV               battery monitor    -60     0s  yes  ok
@@ -136,7 +136,7 @@ voltage sense.
 | Service | Paths |
 |---|---|
 | battery | `/Dc/0/Voltage`, `/Dc/0/Current`, `/Dc/0/Power` (V × I), `/Soc`, `/ConsumedAmphours`, `/TimeToGo`; depending on the aux input `/Dc/1/Voltage` (starter battery), `/Dc/0/MidVoltage` and `/Dc/0/MidVoltageDeviation`, or `/Dc/0/Temperature`; from the alarm reason `/Alarms/LowVoltage`, `HighVoltage`, `LowSoc`, `LowStarterVoltage`, `HighStarterVoltage`, `LowTemperature`, `HighTemperature`, `MidVoltage` (0 ok, 2 alarm) |
-| solarcharger | `/State`, `/ErrorCode`, `/Dc/0/Voltage`, `/Dc/0/Current`, `/Yield/Power`, `/History/Daily/0/Yield`, `/Load/I`, `/Yield/User` |
+| solarcharger | `/State`, `/ErrorCode`, `/Dc/0/Voltage`, `/Dc/0/Current`, `/Yield/Power`, `/Load/I`, `/Yield/User`; daily history `/History/Overall/DaysAvailable`, `/History/Daily/0..30/{Yield,MaxPower,MinBatteryVoltage,MaxBatteryVoltage,MaxBatteryCurrent,TimeInBulk,TimeInAbsorption,TimeInFloat,LastError1..4}` (`MaxPvVoltage` is not in the readout) |
 | charger | `/State`, `/ErrorCode`, `/Dc/0..2/Voltage`, `/Dc/0..2/Current`, `/NrOfOutputs`, `/Dc/0/Temperature`, `/Ac/In/L1/I` |
 | dcsource (optional, for AC chargers) | `/Settings/MonitorMode` = -2 (AC charger), `/Dc/0/Voltage`, `/Dc/0/Current` and `/Dc/0/Power` (all outputs together), `/Dc/0/Temperature` |
 | switch (optional, chargers with a PIN) | `/State` = 256 (connected), `/SwitchableOutput/night/State` (writable: 1 night mode, 0 normal), `/SwitchableOutput/night/Status` (0 off, 9 on, 8 fault), `/SwitchableOutput/night/Name` = *Night mode*, `/SwitchableOutput/night/Settings/{CustomName,Group,ShowUIControl}` (writable, kept in the settings), `/SwitchableOutput/night/Settings/Type` = 1 (toggle) |
@@ -150,6 +150,16 @@ A SmartShunt becomes the system battery monitor when it is the only one
 today's yield and starts over when the charger begins a new day. The total
 is kept in `/data/victron-ble/state.json`. Energy produced while the charger
 is not heard at the end of a day is missed.
+
+**Solar history:** a solar charger on VE.Direct publishes 31 days of history
+from its own memory; the advertisement has none. `dbus-victron-ble` records it
+instead, so the solar charger's *History* page in gui-v2 (and VRM) has a table
+and a chart, as in VictronConnect. Days are calendar days in the local time
+of the Venus time zone setting, day 0 is today. The yield of a day is the sum
+of the increases of the charger's daily yield; the other values are the
+extremes and the time in each charge state seen while the charger was heard.
+History starts when the service is installed; days on which the GX was off
+stay empty. It is kept in `/data/victron-ble/state.json`.
 
 **AC chargers in the gui-v2 overview:** gui-v2 shows an AC charger in its
 *Inverter / Charger* widget. The widget's text is the system state, which
@@ -288,6 +298,7 @@ victron-ble             command line tool
 victronble/records.py   record decoders (bit layouts of the specification)
 victronble/hci.py       passive HCI listener, scan commands
 victronble/manager.py   devices, keys, D-Bus services
+victronble/history.py   daily history of solar chargers
 victronble/control.py   night mode switch: helper sessions, switch service
 victronble/vesmart.py   VE.Smart (GATT) protocol, the Bluetooth session helper
 victronble/cbor.py      minimal CBOR for VE.Smart

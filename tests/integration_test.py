@@ -352,6 +352,10 @@ def main():
         check(wait_for(lambda: get(solar, "/Yield/User") > 0, timeout=5), "Yield/User counter starts")
         y1 = get(solar, "/Yield/User")
         check(wait_for(lambda: get(solar, "/Yield/User") > y1, timeout=5), "Yield/User grows")
+        check(get(solar, "/History/Overall/DaysAvailable") == 1, "solar history: 1 day available")
+        check(get(solar, "/History/Daily/0/MaxPower") == 104, "solar history: max power of today")
+        check(len(get(solar, "/History/Daily/1/Yield")) == 0, "solar history: no yesterday yet")
+        check(text(solar, "/History/Daily/0/MaxBatteryVoltage").endswith("V"), "solar history: formatted text")
 
         print("others:")
         status = wait_for(lambda: json.load(open(status_file)), timeout=8)

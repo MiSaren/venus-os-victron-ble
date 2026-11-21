@@ -15,6 +15,7 @@ import dbus
 from vedbus import VeDbusService
 
 from . import PROCESS_NAME, VERSION, aes, hci, pins, products, records
+from . import history as hist
 from . import control as ctl
 from . import settings as st
 
@@ -35,6 +36,7 @@ RETRY_NAME_TAKEN = 60
 MIRROR_GROUP_SUFFIX = "_dcsource"  # settings group of a charger's DC source service
 SWITCH_GROUP_SUFFIX = "_switch"  # settings group of a charger's night mode switch service
 RETRY_ERROR = 30
+HISTORY_DATA_TIMEOUT = 60  # no readout for this long: time in charge states is not counted
 WRONG_KEY_LOG_INTERVAL = 600
 
 
@@ -51,9 +53,11 @@ class YieldCounter:
     def __init__(self, total=0.0, last_daily=None):
         self.total = float(total or 0.0)
         self.last_daily = last_daily
+        self.delta = 0.0  # energy added by the last update()
 
     def update(self, daily):
         """Feed the yield of today; returns True when the total changed."""
+        self.delta = 0.0
         if daily is None:
             return False
         if self.last_daily is None:
@@ -63,6 +67,7 @@ class YieldCounter:
         self.last_daily = daily
         if delta <= 0:
             return False
+        self.delta = round(delta, 2)
         self.total = round(self.total + delta, 2)
         return True
 
@@ -201,6 +206,7 @@ class Device:
         self.blocked = None  # why we must not publish it ourselves
         self.wrong_key_logged = -WRONG_KEY_LOG_INTERVAL
         self.yield_counter = None
+        self.history = None  # daily history of a solar charger
 
 
 class Manager:
@@ -398,6 +404,7 @@ class Manager:
         values = decoder.decode(aes.ctr(key, nonce, payload))
         if decoder.role == "solarcharger":
             values["/Yield/User"] = self._yield_user(dev, values.get("/History/Daily/0/Yield"))
+            values.update(self._solar_history(dev, values))
         dev.last_nonce = nonce
         dev.last_payload = payload
         dev.last_update = now
@@ -420,6 +427,29 @@ class Manager:
             self.state_dirty = True
         return counter.value
 
+    def _solar_history(self, dev, values):
+        """Record an advertisement in the daily history; returns the history paths
+        to publish (all of them while the service does not exist yet). The daily
+        yield of the readout is replaced by the yield of the calendar day."""
+        saved = self.state.setdefault(dev.dev_id, {})
+        date = hist.local_date()
+        delta = dev.yield_counter.delta
+        if dev.history is None:
+            dev.history = hist.SolarHistory(saved.get("history"))
+            if not dev.history.days and (values.get("/State") or time.localtime().tm_hour >= 12):
+                # First start: today's yield so far is what the charger counted. Its day
+                # starts at sunrise, so before that (charger off in the small hours) the
+                # counter still shows yesterday.
+                dev.history.today(date)
+                dev.history.add_energy(values.get("/History/Daily/0/Yield"), date)
+                delta = 0.0
+        dev.history.add_energy(delta, date)
+        dev.history.sample(values, date)
+        if dev.history.dirty:
+            saved["history"] = dev.history.days
+            self.state_dirty = True
+        return dev.history.values() if dev.service is None else dev.history.changes()
+
     def _publish(self, dev, decoder, values, now):
         if dev.service is not None and dev.service.role != decoder.role:
             self._remove_service(dev, "record type changed")
@@ -438,7 +468,7 @@ class Manager:
                 instance,
                 dev.product_id,
                 products.name(dev.product_id, decoder.generic_name),
-                decoder.paths,
+                dict(decoder.paths, **hist.PATHS) if decoder.role == "solarcharger" else decoder.paths,
                 values,
                 custom_name=self.config.get(dev.mac, {}).get("name", ""),
                 on_custom_name=lambda svc, name: self._custom_name_changed(dev, svc, name),
@@ -669,11 +699,24 @@ class Manager:
             if dev.service is not None and now - dev.last_update > self.timeout:
                 self._remove_service(dev, "no data for %d s" % self.timeout)
                 dev.state = "no data"
+            if dev.history is not None:
+                self._history_tick(dev, now)
             if dev.service is None and mac not in self.config and now - dev.last_seen > FORGET_AFTER:
                 del self.devices[mac]
         if self.state_dirty and now - self.last_state_save >= STATE_SAVE_INTERVAL:
             self.save_state()
         self.write_status()
+
+    def _history_tick(self, dev, now):
+        """Time spent in the charge states, day rollover at midnight."""
+        if dev.service is None or now - dev.last_update > HISTORY_DATA_TIMEOUT:
+            dev.history.pause()
+            return
+        dev.history.account_time(dev.values.get("/State"), now, hist.local_date())
+        if dev.history.dirty:
+            self.state.setdefault(dev.dev_id, {})["history"] = dev.history.days
+            self.state_dirty = True
+            dev.service.update(dev.history.changes())
 
     def shutdown(self):
         if self.runner is not None:
