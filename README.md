@@ -58,6 +58,10 @@ charger. Technical background: [docs/design.md](docs/design.md).
   publishes itself.
 - A device disappears from D-Bus after 5 minutes without data, and comes
   back when it is heard again.
+- An AC charger advertises only while it is on its mains, and its last
+  records are sent while it powers down (an IP22: still "Bulk", 0.2 A at
+  19.2 V). After 15 s without data it is therefore shown as Off with 0 A and
+  an unknown voltage until it is heard again or disappears.
 - Everything lives in `/data`, with a hook in `/data/rcS.local`. Firmware
   updates do not remove it.
 

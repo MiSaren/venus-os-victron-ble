@@ -449,6 +449,52 @@ class ManagerTest(unittest.TestCase):
             advgen.ac_charger(state=state, outputs=list(outputs), temperature=25),
         )
 
+    def test_charger_silent_is_off(self):
+        """An IP22 only advertises on its mains and its last records are taken
+        while it powers down: once quiet it is published as Off (0 A), well
+        before the normal removal; heard again, its own values come back."""
+        self.settings.set_device_setting(IP22, "Key", KEY.hex())
+        self.settings.set_device_setting(IP22, "DcSource", 1)
+        self.m.reload_config()
+        self.m.on_advertisement(IP22, -60, self.ip22(1))
+        charger, mirror = FakeService.created
+        self.clock.now += manager.CHARGER_SILENT_OFF - 1
+        self.m.tick()
+        self.assertEqual(charger.values["/State"], 3)
+        self.clock.now += 2
+        self.m.tick()
+        self.assertEqual(charger.values["/State"], 0)
+        self.assertEqual(charger.values["/Dc/0/Current"], 0.0)
+        self.assertIsNone(charger.values["/Dc/0/Voltage"])
+        self.assertIsNone(charger.values["/Dc/1/Current"])  # outputs it does not have stay unknown
+        self.assertEqual((mirror.values["/Dc/0/Current"], mirror.values["/Dc/0/Power"]), (0.0, 0.0))
+        self.assertIsNone(mirror.values["/Dc/0/Voltage"])
+        self.assertFalse(charger.closed)
+        self.assertEqual(self.m.devices[IP22].state, "off (not heard)")
+        updates = charger.updates
+        self.m.tick()
+        self.assertEqual(charger.updates, updates)  # published once
+        # heard again, even with the very same record as before
+        self.m.on_advertisement(IP22, -60, self.ip22(1))
+        self.assertEqual((charger.values["/State"], charger.values["/Dc/0/Current"]), (3, 29.4))
+        self.assertEqual(mirror.values["/Dc/0/Power"], round(14.2 * 29.4, 1))
+        self.assertEqual(self.m.devices[IP22].state, "ok")
+        # quiet until the normal timeout: Off first, then removed
+        self.clock.now += 301
+        self.m.tick()
+        self.assertTrue(charger.closed)
+
+    def test_silent_battery_monitor_keeps_its_values(self):
+        """Only AC chargers go Off when quiet; a battery monitor keeps its
+        values until the normal timeout (weak links, see the README)."""
+        self.settings.set_device_setting(SHUNT, "Key", KEY.hex())
+        self.m.reload_config()
+        self.m.on_advertisement(SHUNT, -70, self.shunt(1))
+        svc = FakeService.created[0]
+        self.clock.now += 60
+        self.m.tick()
+        self.assertEqual((svc.updates, svc.values["/Soc"]), (0, 80.0))
+
     def test_dcsource_off_by_default(self):
         self.settings.set_device_setting(IP22, "Key", KEY.hex())
         self.m.reload_config()

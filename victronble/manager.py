@@ -37,6 +37,11 @@ MIRROR_GROUP_SUFFIX = "_dcsource"  # settings group of a charger's DC source ser
 SWITCH_GROUP_SUFFIX = "_switch"  # settings group of a charger's night mode switch service
 RETRY_ERROR = 30
 HISTORY_DATA_TIMEOUT = 60  # no readout for this long: time in charge states is not counted
+# An AC charger advertises only while it is on its mains (an IP22: about 5 times a
+# second), and the last records before it falls silent carry meaningless values. Not
+# heard for this long, it is published as Off (0 A) until it is heard again or
+# removed after `timeout`.
+CHARGER_SILENT_OFF = 15
 WRONG_KEY_LOG_INTERVAL = 600
 
 
@@ -197,6 +202,7 @@ class Device:
         self.last_payload = None
         self.last_update = 0.0  # last advertisement with valid, current data
         self.values = {}
+        self.silent_off = False  # an AC charger gone quiet, published as Off
         self.service = None
         self.retry_at = 0.0
         self.mirror = None  # optional DC source service of an AC charger
@@ -397,11 +403,14 @@ class Manager:
             if dev.service is not None:
                 self._remove_service(dev, "wrong key")
             return
-        if nonce == dev.last_nonce and payload == dev.last_payload and dev.service is not None:
+        if nonce == dev.last_nonce and payload == dev.last_payload and dev.service is not None and not dev.silent_off:
             dev.last_update = now  # the same data again: still current
             return
 
         values = decoder.decode(aes.ctr(key, nonce, payload))
+        if dev.silent_off:
+            dev.silent_off = False
+            log.info("%s: heard again", address)
         if decoder.role == "solarcharger":
             values["/Yield/User"] = self._yield_user(dev, values.get("/History/Daily/0/Yield"))
             values.update(self._solar_history(dev, values))
@@ -696,6 +705,13 @@ class Manager:
         for mac, dev in list(self.devices.items()):
             if dev.mirror is not None:
                 dev.mirror.tick(now)
+            if (
+                dev.service is not None
+                and dev.service.role == "charger"
+                and not dev.silent_off
+                and now - dev.last_update > CHARGER_SILENT_OFF
+            ):
+                self._charger_silent(dev, now)
             if dev.service is not None and now - dev.last_update > self.timeout:
                 self._remove_service(dev, "no data for %d s" % self.timeout)
                 dev.state = "no data"
@@ -706,6 +722,16 @@ class Manager:
         if self.state_dirty and now - self.last_state_save >= STATE_SAVE_INTERVAL:
             self.save_state()
         self.write_status()
+
+    def _charger_silent(self, dev, now):
+        """An AC charger has gone quiet: it is off its mains. Publish it as Off
+        instead of its last (power-down) values until it is heard again."""
+        dev.silent_off = True
+        dev.values = records.charger_off(dev.values)
+        dev.service.update(dev.values)
+        self._update_mirror(dev, now)
+        dev.state = "off (not heard)"
+        log.info("%s: not heard for %d s (off its mains?): published as Off", dev.mac, CHARGER_SILENT_OFF)
 
     def _history_tick(self, dev, now):
         """Time spent in the charge states, day rollover at midnight."""

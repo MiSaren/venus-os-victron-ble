@@ -320,9 +320,9 @@ def charger_dc_totals(values):
     power = current = None
     for n in range(len(AcCharger.OUTPUTS)):
         voltage, amps = values.get("/Dc/%d/Voltage" % n), values.get("/Dc/%d/Current" % n)
-        if voltage is None or amps is None:
-            continue
-        power = (power or 0.0) + voltage * amps
+        if amps is None or (voltage is None and amps):
+            continue  # an output at 0 A counts without a voltage (charger_off)
+        power = (power or 0.0) + (voltage or 0.0) * amps
         current = (current or 0.0) + amps
     return {
         "/Dc/0/Voltage": values.get("/Dc/0/Voltage"),
@@ -330,6 +330,22 @@ def charger_dc_totals(values):
         "/Dc/0/Power": None if power is None else round(power, 1),
         "/Dc/0/Temperature": values.get("/Dc/0/Temperature"),
     }
+
+
+def charger_off(values):
+    """The values of an AC charger that has gone quiet: state Off, 0 A on the
+    outputs it has. Voltages and temperature become unknown: the last records
+    before a charger falls silent are taken while it powers down and carry
+    meaningless values (an IP22: still "Bulk", 0.2 A at 19.2 V)."""
+    off = dict(values)
+    off["/State"] = 0
+    off["/Ac/In/L1/I"] = None
+    off["/Dc/0/Temperature"] = None
+    for n in range(len(AcCharger.OUTPUTS)):
+        if values.get("/Dc/%d/Current" % n) is not None or values.get("/Dc/%d/Voltage" % n) is not None:
+            off["/Dc/%d/Current" % n] = 0.0
+        off["/Dc/%d/Voltage" % n] = None
+    return off
 
 
 def parse_manufacturer_data(data):
