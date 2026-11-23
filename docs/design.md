@@ -349,6 +349,8 @@ instead of waking up for every event would cut most of that.
   `tests/advgen.py`.
 - `tests/test_hci.py`, `tests/test_listener.py`: HCI event parsing, malformed
   packets, listener behaviour with a socket pair, scan watchdog.
+- `tests/test_history.py`: the daily history of solar chargers: records,
+  day rollover, published paths.
 - `tests/test_manager.py`: keys, wrong keys, timeouts, returns, renames, VRM
   instances, record type changes, the yield counter and its persistence,
   and the night mode switch lifecycle with a fake runner.

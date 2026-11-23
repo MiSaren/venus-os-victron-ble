@@ -66,7 +66,6 @@ from . import settings as st
 
 log = logging.getLogger("vesmart")
 
-SERVICE_UUID = "306b0001-b081-4037-83dc-e59fcc3cdfd0"
 UUID_CONTROL = "306b0002-b081-4037-83dc-e59fcc3cdfd0"
 UUID_LAST = "306b0003-b081-4037-83dc-e59fcc3cdfd0"
 UUID_DATA = "306b0004-b081-4037-83dc-e59fcc3cdfd0"

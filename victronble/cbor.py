@@ -127,12 +127,3 @@ class Decoder:
                 out[key if not isinstance(key, list) else tuple(key)] = self.item()
             return out
         return ("tag", n, self.item())
-
-
-def decode_seq(data):
-    """All items of a CBOR sequence; raises Truncated or ValueError."""
-    dec = Decoder(data)
-    items = []
-    while not dec.empty():
-        items.append(dec.item())
-    return items

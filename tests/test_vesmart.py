@@ -12,6 +12,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from victronble import cbor, vesmart  # noqa: E402
 
 
+def decode_seq(data):
+    """All items of a CBOR sequence; raises Truncated or ValueError."""
+    dec = cbor.Decoder(data)
+    items = []
+    while not dec.empty():
+        items.append(dec.item())
+    return items
+
+
 class CborTest(unittest.TestCase):
     def test_integers(self):
         for value, hexed in (
@@ -26,26 +35,26 @@ class CborTest(unittest.TestCase):
             (-25, "3818"),
         ):
             self.assertEqual(cbor.encode(value).hex(), hexed, value)
-            self.assertEqual(cbor.decode_seq(bytes.fromhex(hexed)), [value])
+            self.assertEqual(decode_seq(bytes.fromhex(hexed)), [value])
 
     def test_strings_and_containers(self):
         value = [b"\x02", "Night mode", [1, 2], {1: b""}, True, False, None]
-        self.assertEqual(cbor.decode_seq(cbor.encode(value)), [value])
+        self.assertEqual(decode_seq(cbor.encode(value)), [value])
 
     def test_indefinite_array(self):
-        self.assertEqual(cbor.decode_seq(bytes.fromhex("029f0000ff")), [2, [0, 0]])
+        self.assertEqual(decode_seq(bytes.fromhex("029f0000ff")), [2, [0, 0]])
 
     def test_victronconnect_init(self):
         # keep-alive 10 s on instance 0, subscribe instances 1 and 3 (SmartSolar)
         self.assertEqual(
-            cbor.decode_seq(bytes.fromhex("060082189342102703010303")),
+            decode_seq(bytes.fromhex("060082189342102703010303")),
             [6, 0, [0x93, b"\x10\x27"], 3, 1, 3, 3],
         )
 
     def test_truncated(self):
         for hexed in ("19e0", "4302", "82 01".replace(" ", ""), "9f00"):
             with self.assertRaises(ValueError, msg=hexed):
-                cbor.decode_seq(bytes.fromhex(hexed))
+                decode_seq(bytes.fromhex(hexed))
 
 
 class FrameTest(unittest.TestCase):
